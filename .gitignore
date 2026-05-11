@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Generated outputs
+images/
+depth_output/
+
+# Legacy folder
+old/
+
+# OS
+.DS_Store
+Thumbs.db
