@@ -50,6 +50,24 @@ COLOR_CHARGE              = "#cc0000"  # red charge overlay line
 
 # ── XML Parsing ─────────────────────────────────────────────────────────────────
 
+def _hole_display_name(hole_name, hole_id):
+    """Stable hole id for labels and tables (H1, H2, …)."""
+    if hole_name and str(hole_name).strip():
+        return str(hole_name).strip()
+    hid = str(hole_id).strip()
+    if not hid:
+        return ""
+    if hid.upper().startswith("H"):
+        return hid
+    return f"H{hid}"
+
+
+def _format_hole_label(hole_name, hole_id, depth_m):
+    """Plan label: hole id + depth in metres (e.g. 'H8 29.605')."""
+    display = _hole_display_name(hole_name, hole_id)
+    return f"{display} {depth_m:.3f}" if display else f"{depth_m:.3f}"
+
+
 def _text(elem, tag):
     child = elem.find(tag, NS)
     return child.text if child is not None else None
@@ -85,10 +103,11 @@ def parse_xml(xml_source, filename=None):
         hole_id   = _text(hole, "drp:HoleId")   or ""
         hole_name = _text(hole, "drp:HoleName") or ""
         distance  = math.hypot(x2 - x1, y2 - y1)
-        label = f"{hole_name}_{distance:.3f}" if hole_name else f"H{hole_id}_{distance:.3f}"
+        display = _hole_display_name(hole_name, hole_id)
+        label = _format_hole_label(hole_name, hole_id, distance)
 
         holes.append({
-            "id": hole_id, "name": hole_name, "label": label,
+            "id": hole_id, "name": hole_name, "display": display, "label": label,
             "x1": x1, "y1": y1, "x2": x2, "y2": y2,
             "diameter_mm": drill_dia,
         })
@@ -150,7 +169,7 @@ def build_charge_table(holes, stemming_overrides=None, delay_map=None,
 
     rows = []
     for h in holes:
-        hole_key    = h["name"] or h["id"]
+        hole_key    = h.get("display") or h["name"] or h["id"]
         depth_m     = math.hypot(h["x2"] - h["x1"], h["y2"] - h["y1"])
         diameter_mm = diameter_overrides.get(hole_key, h.get("diameter_mm", 89.0))
 
@@ -185,6 +204,44 @@ def build_charge_table(holes, stemming_overrides=None, delay_map=None,
             "x2": h["x2"], "y2": h["y2"],
         })
     return rows
+
+
+# ── Charge table row formatting (shared by PNG report, PDF, CSV) ─────────────────
+
+CHARGE_TABLE_COL_LABELS = [
+    "Number", "\u00d8 (mm)", "Length (m)", "Act. meters",
+    "Stemming (m)", "Ch. length (m)", "Charge (kg)", "Act. charge", "Delay (ms)",
+]
+
+
+def _charge_row_cells(row):
+    delay_str = (f"{row['delay_ms']} ms"
+                 if row["delay_ms"] not in ("", None) else "")
+    return [
+        row["hole_key"],
+        f"{row['diameter_mm']:.0f}",
+        f"{row['depth_m']:.3f}",
+        "",
+        f"{row['stemming_m']:.2f}",
+        f"{row['charge_length_m']:.2f}",
+        f"{row['charge_kg']:.2f}",
+        "",
+        delay_str,
+    ]
+
+
+def format_charge_table_rows(charge_data):
+    """Build table/CSV cell rows from charge_data.
+
+    Returns (data_rows, csv_rows, totals_row, total_charge_kg).
+    data_rows and csv_rows are identical; both are returned for clarity at call sites.
+    """
+    data_rows = [_charge_row_cells(row) for row in charge_data]
+    csv_rows = list(data_rows)
+    total_charge = sum(r["charge_kg"] for r in charge_data)
+    totals_row = ["", "", "", "", "", "Total Charge",
+                  f"{total_charge:.2f} kg", "", ""]
+    return data_rows, csv_rows, totals_row, total_charge
 
 
 # ── Scale bar ───────────────────────────────────────────────────────────────────
@@ -267,7 +324,7 @@ def _draw_plan_on_ax(ax, plan_id, holes, segments, settings, charge_data=None):
                 fontsize=lbl_fs, zorder=5, color="#111111")
 
         # Charge overlay + delay label
-        hole_key = h["name"] or h["id"]
+        hole_key = h.get("display") or h["name"] or h["id"]
         crow = charge_lookup.get(hole_key)
         if crow:
             depth  = crow["depth_m"]
@@ -331,11 +388,13 @@ def build_figure(plan_name, plan_id, holes, segments, settings, charge_data=None
     fig, ax = plt.subplots(figsize=(fw, fh))
     fig.patch.set_facecolor(c_bg)
     _draw_plan_on_ax(ax, plan_id, holes, segments, settings, charge_data)
+    if not settings.get("show_title", True):
+        fig.subplots_adjust(top=0.98, bottom=0.06, left=0.04, right=0.98)
 
     csv_rows = []
     for h in holes:
         depth = math.hypot(h["x2"] - h["x1"], h["y2"] - h["y1"])
-        csv_rows.append([h["name"] or h["id"], f"{depth:.3f}"])
+        csv_rows.append([h.get("display") or h["name"] or h["id"], f"{depth:.3f}"])
     return fig, csv_rows
 
 
@@ -359,37 +418,14 @@ def build_report_figure(plan_name, plan_id, holes, segments, settings, charge_da
     ax_plan  = fig.add_subplot(gs[0])
     ax_table = fig.add_subplot(gs[1])
 
-    _draw_plan_on_ax(ax_plan, plan_id, holes, segments, settings, charge_data)
+    plan_settings = dict(settings)
+    plan_settings["show_title"] = False
+    _draw_plan_on_ax(ax_plan, plan_id, holes, segments, plan_settings, charge_data)
 
-    col_labels = [
-        "Number", "O (mm)", "Length (m)", "Act. meters",
-        "Stemming (m)", "Ch. length (m)", "Charge (kg)", "Act. charge", "Delay (ms)"
-    ]
-    cell_text = []
-    report_csv_rows = []
-    for row in charge_data:
-        delay_str = (f"{row['delay_ms']} ms"
-                     if row["delay_ms"] not in ("", None) else "")
-        cell_text.append([
-            row["hole_key"],
-            f"{row['diameter_mm']:.0f}",
-            f"{row['depth_m']:.3f}",
-            "",
-            f"{row['stemming_m']:.2f}",
-            f"{row['charge_length_m']:.2f}",
-            f"{row['charge_kg']:.2f}",
-            "",
-            delay_str,
-        ])
-        report_csv_rows.append([
-            row["hole_key"], f"{row['diameter_mm']:.0f}", f"{row['depth_m']:.3f}",
-            "", f"{row['stemming_m']:.2f}", f"{row['charge_length_m']:.2f}",
-            f"{row['charge_kg']:.2f}", "", delay_str,
-        ])
-
-    total_charge = sum(r["charge_kg"] for r in charge_data)
-    cell_text.append(["", "", "", "", "", "Total Charge",
-                       f"{total_charge:.2f} kg", "", ""])
+    col_labels = list(CHARGE_TABLE_COL_LABELS)
+    cell_text, report_csv_rows, totals_row, _ = format_charge_table_rows(charge_data)
+    cell_text = list(cell_text)
+    cell_text.append(totals_row)
 
     ax_table.axis("off")
     tbl = ax_table.table(
@@ -422,7 +458,8 @@ def build_report_figure(plan_name, plan_id, holes, segments, settings, charge_da
 
 # ── PDF report ───────────────────────────────────────────────────────────────────
 
-def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data, company=""):
+def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data,
+                    company="", plan_png_bytes=None):
     """Build a print-ready A4 portrait PDF blast report.
 
     Layout — page 1:
@@ -431,6 +468,9 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data, 
 
     Continuation pages (if rows overflow page 1):
         header → table rows → totals on last page.
+
+    plan_png_bytes : optional PNG bytes for the drill plan. When provided, the plan
+        is not re-rendered with matplotlib (faster; matches the standalone plan PNG).
 
     Returns raw PDF bytes.
     """
@@ -464,29 +504,11 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data, 
     KAMOA_LOGO = os.path.join(_logo_dir, "Kamoa_LOGO.png")
 
     # ── Table column definitions ──────────────────────────────────────────────
-    COL_LABELS = [
-        "Number", "\u00d8 (mm)", "Length (m)", "Act. meters",
-        "Stemming (m)", "Ch. length (m)", "Charge (kg)", "Act. charge", "Delay (ms)",
-    ]
+    COL_LABELS = list(CHARGE_TABLE_COL_LABELS)
     _cw = [38, 42, 60, 68, 58, 63, 56, 68]
     COL_WIDTHS = _cw + [CONTENT_W - sum(_cw)]
 
-    all_data_rows = []
-    for row in charge_data:
-        delay_str = (f"{row['delay_ms']} ms" if row["delay_ms"] not in ("", None) else "")
-        all_data_rows.append([
-            row["hole_key"],
-            f"{row['diameter_mm']:.0f}",
-            f"{row['depth_m']:.3f}",
-            "",
-            f"{row['stemming_m']:.2f}",
-            f"{row['charge_length_m']:.2f}",
-            f"{row['charge_kg']:.2f}",
-            "",
-            delay_str,
-        ])
-    total_charge = sum(r["charge_kg"] for r in charge_data)
-    TOTALS_ROW   = ["", "", "", "", "", "Total Charge", f"{total_charge:.2f} kg", "", ""]
+    all_data_rows, _, TOTALS_ROW, _ = format_charge_table_rows(charge_data)
 
     # ── Page 1: compute dynamic plan height ───────────────────────────────────
     # Available height below the info box on page 1:
@@ -516,18 +538,22 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data, 
             chunk, remaining = remaining[:max_rows_pN], remaining[max_rows_pN:]
             pages.append([COL_LABELS] + chunk + ([TOTALS_ROW] if not remaining else []))
 
-    # ── Render plan PNG (no title — already shown in header) ─────────────────
-    _ps = dict(settings)
-    _ps["fig_width"]   = CONTENT_W / 72.0
-    _ps["fig_height"]  = PLAN_H    / 72.0
-    _ps["show_title"]  = False          # title is in the PDF header, not the image
-    _fig, _ = build_figure(plan_name, plan_id, holes, segments, _ps, charge_data)
-    _plan_buf = _BytesIO()
-    _fig.savefig(_plan_buf, format="png", dpi=150, bbox_inches="tight",
-                 facecolor=_fig.get_facecolor())
-    _plan_buf.seek(0)
-    plt.close(_fig)
-    plan_img = ImageReader(_plan_buf)
+    # ── Plan image (reuse caller PNG when provided) ───────────────────────────
+    if plan_png_bytes:
+        _plan_buf = _BytesIO(plan_png_bytes)
+        plan_img = ImageReader(_plan_buf)
+    else:
+        _ps = dict(settings)
+        _ps["fig_width"]   = CONTENT_W / 72.0
+        _ps["fig_height"]  = PLAN_H    / 72.0
+        _ps["show_title"]  = False
+        _fig, _ = build_figure(plan_name, plan_id, holes, segments, _ps, charge_data)
+        _plan_buf = _BytesIO()
+        _fig.savefig(_plan_buf, format="png", dpi=150, bbox_inches="tight",
+                     facecolor=_fig.get_facecolor())
+        _plan_buf.seek(0)
+        plt.close(_fig)
+        plan_img = ImageReader(_plan_buf)
 
     # ── Colour helpers ────────────────────────────────────────────────────────
     def _c(h):
@@ -684,6 +710,32 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data, 
     c.save()
     buf.seek(0)
     return buf.getvalue()
+
+
+def merge_pdf_bytes(pdf_parts):
+    """Merge multiple PDF documents into one file (page order preserved).
+
+    pdf_parts : iterable of raw PDF bytes (each a complete PDF).
+    Returns merged PDF bytes, or b'' if pdf_parts is empty.
+    """
+    parts = list(pdf_parts)
+    if not parts:
+        return b""
+    if len(parts) == 1:
+        return parts[0]
+
+    from io import BytesIO as _BytesIO
+
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter()
+    for raw in parts:
+        reader = PdfReader(_BytesIO(raw))
+        for page in reader.pages:
+            writer.add_page(page)
+    out = _BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
 # ── CLI render ───────────────────────────────────────────────────────────────────

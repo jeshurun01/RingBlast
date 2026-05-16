@@ -23,12 +23,22 @@ from xml_to_image import (
     build_figure,
     build_pdf_bytes,
     build_report_figure,
+    merge_pdf_bytes,
     compute_stemming,
+    format_charge_table_rows,
     parse_xml,
 )
 
+PREVIEW_DPI = 96
+PREVIEW_MANUAL_MIN_HOLES = 40
+
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def _parse_uploaded_xml(file_bytes: bytes, filename: str):
+    """Parse XML bytes (cached by content hash)."""
+    return parse_xml(io.BytesIO(file_bytes), filename=filename)
 
 def _fig_to_png_bytes(fig, dpi):
     buf = io.BytesIO()
@@ -57,6 +67,140 @@ def _report_csv_bytes(report_csv_rows):
     return buf.getvalue().encode()
 
 
+def _zip_entry_count(results, output_formats):
+    n = 0
+    for data in results.values():
+        n += 2  # PDF + CSV
+        if output_formats.get("plan_png") and data.get("plan_png"):
+            n += 1
+        if output_formats.get("report_png") and data.get("report_png"):
+            n += 1
+    if len(results) > 1:
+        n += 1  # combined PDF
+    return n
+
+
+def _merged_pdf_bytes(results):
+    return merge_pdf_bytes(data["pdf"] for _, data in results.items())
+
+
+def _build_zip_bytes(results, output_formats):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        if len(results) > 1:
+            zf.writestr("reports_pdf/combined_blast_reports.pdf", _merged_pdf_bytes(results))
+        for base, data in results.items():
+            zf.writestr(f"reports_pdf/{base}_blast_report.pdf", data["pdf"])
+            zf.writestr(f"csv/{base}_charge.csv", data["csv"])
+            if output_formats.get("plan_png") and data.get("plan_png"):
+                zf.writestr(f"plans/{base}.png", data["plan_png"])
+            if output_formats.get("report_png") and data.get("report_png"):
+                zf.writestr(f"reports_png/{base}_report.png", data["report_png"])
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _results_zip_cache_key(results, output_formats):
+    h = hashlib.md5()
+    for base in sorted(results.keys()):
+        data = results[base]
+        h.update(base.encode())
+        for field in ("pdf", "csv", "plan_png", "report_png"):
+            blob = data.get(field)
+            if blob:
+                h.update(blob)
+    h.update(repr(sorted(output_formats.items())).encode())
+    return h.hexdigest()
+
+
+def _get_cached_zip_bytes(results, output_formats):
+    key = _results_zip_cache_key(results, output_formats)
+    if st.session_state.get("zip_cache_key") == key:
+        return st.session_state["zip_cache_bytes"]
+    zip_bytes = _build_zip_bytes(results, output_formats)
+    st.session_state["zip_cache_key"] = key
+    st.session_state["zip_cache_bytes"] = zip_bytes
+    return zip_bytes
+
+
+def _clear_zip_cache():
+    st.session_state.pop("zip_cache_key", None)
+    st.session_state.pop("zip_cache_bytes", None)
+    st.session_state.pop("merged_pdf_cache_key", None)
+    st.session_state.pop("merged_pdf_cache_bytes", None)
+
+
+def _get_cached_merged_pdf_bytes(results, output_formats):
+    key = _results_zip_cache_key(results, output_formats)
+    if st.session_state.get("merged_pdf_cache_key") == key:
+        return st.session_state["merged_pdf_cache_bytes"]
+    merged = _merged_pdf_bytes(results)
+    st.session_state["merged_pdf_cache_key"] = key
+    st.session_state["merged_pdf_cache_bytes"] = merged
+    return merged
+
+
+def _charge_context(edited, pdata, charge_params):
+    stemming_overrides = dict(zip(edited["Hole"], edited["Stemming (m)"]))
+    diameter_overrides = dict(zip(edited["Hole"], edited["Diameter (mm)"]))
+    delay_map = {
+        row["Hole"]: int(row["Delay (ms)"])
+        for _, row in edited.iterrows()
+        if pd.notna(row["Delay (ms)"]) and row["Delay (ms)"] != ""
+    }
+    charge_data = build_charge_table(
+        pdata["holes"],
+        stemming_overrides=stemming_overrides,
+        diameter_overrides=diameter_overrides,
+        delay_map=delay_map,
+        **{k: v for k, v in charge_params.items() if k != "diameter_override_mm"},
+    )
+    return charge_data
+
+
+def _render_plan_preview(base, pdata, edited, settings, charge_params):
+    png_cache_key = f"preview_png_{base}"
+    hash_cache_key = f"preview_hash_{base}"
+    try:
+        charge_data_preview = _charge_context(edited, pdata, charge_params)
+        preview_settings = dict(settings)
+        preview_settings["fig_width"] = 7
+        preview_settings["fig_height"] = 6
+        preview_settings["show_title"] = False
+        fig_preview, _ = build_figure(
+            pdata["plan_name"], pdata["plan_id"],
+            pdata["holes"], pdata["segments"],
+            preview_settings, charge_data_preview,
+        )
+        st.session_state[png_cache_key] = _fig_to_png_bytes(fig_preview, PREVIEW_DPI)
+        st.session_state[hash_cache_key] = _preview_hash(edited, settings, charge_params)
+        plt.close(fig_preview)
+    except Exception as exc:
+        st.warning(f"Preview error: {exc}")
+
+
+def _plan_preview_panel(base, pdata, edited, settings, charge_params):
+    """Live plan preview — re-renders when table or style inputs change."""
+    n_holes = len(pdata["holes"])
+    phash = _preview_hash(edited, settings, charge_params)
+    hash_cache_key = f"preview_hash_{base}"
+    png_cache_key = f"preview_png_{base}"
+
+    if n_holes > PREVIEW_MANUAL_MIN_HOLES:
+        st.caption(f"{n_holes} holes — use **Update preview** to refresh (large plan).")
+        if st.button("Update preview", key=f"preview_btn_{base}", width="stretch"):
+            _render_plan_preview(base, pdata, edited, settings, charge_params)
+    elif st.session_state.get(hash_cache_key) != phash:
+        _render_plan_preview(base, pdata, edited, settings, charge_params)
+
+    if png_cache_key in st.session_state:
+        st.image(st.session_state[png_cache_key], width="stretch")
+    elif n_holes > PREVIEW_MANUAL_MIN_HOLES:
+        st.caption("Click **Update preview** to render the plan.")
+    else:
+        st.caption("Generating preview…")
+
+
 def _build_default_hole_df(holes, charge_params):
     rows = []
     dia_override = charge_params.get("diameter_override_mm", 0)
@@ -70,7 +214,7 @@ def _build_default_hole_df(holes, charge_params):
             charge_params["short_fixed"],
         )
         rows.append({
-            "Hole":          h["name"] or h["id"],
+            "Hole":          h.get("display") or h["name"] or h["id"],
             "Diameter (mm)": diameter,
             "Depth (m)":     round(depth, 3),
             "Stemming (m)":  round(stemming, 3),
@@ -150,6 +294,26 @@ with st.sidebar:
             "Hole diameter override (mm)", min_value=0, max_value=500, value=0, step=1,
             help="Set to 0 to use the diameter from the XML file. Any other value overrides all holes.")
 
+    st.divider()
+    with st.expander("📦  Output formats", expanded=True):
+        st.caption("PDF blast report and charge CSV are always generated.")
+        include_plan_png = st.checkbox(
+            "Plan PNG",
+            value=False,
+            help="Standalone drill layout image (e.g. for GIS or quick sharing).",
+        )
+    with st.expander("Advanced outputs", expanded=False):
+        include_report_png = st.checkbox(
+            "Report PNG (legacy)",
+            value=False,
+            help="Combined plan + table image. Prefer the PDF; duplicates PDF content.",
+        )
+
+output_formats = {
+    "plan_png":   include_plan_png,
+    "report_png": include_report_png,
+}
+
 settings = {
     "color_hole":        color_hole,
     "color_outline":     color_outline,
@@ -192,8 +356,10 @@ if current_names != st.session_state.get("uploaded_names", []):
     st.session_state["uploaded_names"] = current_names
     st.session_state["parsed_data"]    = {}
     st.session_state.pop("results", None)
+    st.session_state.pop("results_formats", None)
+    _clear_zip_cache()
     for key in [k for k in st.session_state
-                if k.startswith("df_") or k.startswith("edited_") or k.startswith("de_")]:
+                if k.startswith(("df_", "edited_", "de_", "preview_"))]:
         del st.session_state[key]
 
     if uploaded_files:
@@ -202,7 +368,9 @@ if current_names != st.session_state.get("uploaded_names", []):
             base = os.path.splitext(uf.name)[0]
             try:
                 uf.seek(0)
-                plan_name, plan_id, holes, segments = parse_xml(uf, filename=uf.name)
+                file_bytes = uf.read()
+                plan_name, plan_id, holes, segments = _parse_uploaded_xml(
+                    file_bytes, uf.name)
                 st.session_state["parsed_data"][base] = {
                     "plan_name": plan_name, "plan_id": plan_id,
                     "holes": holes, "segments": segments,
@@ -224,8 +392,8 @@ if st.session_state.get("parsed_data"):
     st.divider()
     st.subheader("Step 2 — Edit hole data")
     st.caption("Stemming is auto-calculated from the sidebar parameters. "
-               "Override per hole as needed and set delays. "
-               "The plan preview updates live as you edit.")
+               "Override per hole as needed and set delays — "
+               "the plan preview on the right updates as you edit.")
 
     file_tabs = st.tabs(list(st.session_state["parsed_data"].keys()))
 
@@ -272,7 +440,7 @@ if st.session_state.get("parsed_data"):
 
                 edited = st.data_editor(
                     st.session_state[df_key],
-                    use_container_width=True,
+                    width="stretch",
                     column_config={
                         "Hole":
                             st.column_config.TextColumn("Hole", disabled=True),
@@ -296,50 +464,20 @@ if st.session_state.get("parsed_data"):
                 st.session_state[f"edited_{base}"] = edited
 
             with col_preview:
-                # Live plan preview — only re-render when inputs actually change
-                phash = _preview_hash(edited, settings, charge_params)
-                png_cache_key  = f"preview_png_{base}"
-                hash_cache_key = f"preview_hash_{base}"
-
-                if st.session_state.get(hash_cache_key) != phash:
-                    try:
-                        stemming_overrides = dict(zip(edited["Hole"], edited["Stemming (m)"]))
-                        diameter_overrides = dict(zip(edited["Hole"], edited["Diameter (mm)"]))
-                        delay_map = {
-                            row["Hole"]: int(row["Delay (ms)"])
-                            for _, row in edited.iterrows()
-                            if pd.notna(row["Delay (ms)"]) and row["Delay (ms)"] != ""
-                        }
-                        charge_data_preview = build_charge_table(
-                            pdata["holes"],
-                            stemming_overrides=stemming_overrides,
-                            diameter_overrides=diameter_overrides,
-                            delay_map=delay_map,
-                            **{k: v for k, v in charge_params.items() if k != "diameter_override_mm"},
-                        )
-                        preview_settings = dict(settings)
-                        preview_settings["fig_width"]  = 7
-                        preview_settings["fig_height"] = 6
-                        fig_preview, _ = build_figure(
-                            pdata["plan_name"], pdata["plan_id"],
-                            pdata["holes"], pdata["segments"],
-                            preview_settings, charge_data_preview,
-                        )
-                        st.session_state[png_cache_key]  = _fig_to_png_bytes(fig_preview, 120)
-                        st.session_state[hash_cache_key] = phash
-                        plt.close(fig_preview)
-                    except Exception as exc:
-                        st.warning(f"Preview error: {exc}")
-
-                if png_cache_key in st.session_state:
-                    st.image(st.session_state[png_cache_key], use_container_width=True)
+                _plan_preview_panel(base, pdata, edited, settings, charge_params)
 
     # ── Step 3 — Generate ────────────────────────────────────────────────────────
 
     st.divider()
     st.subheader("Step 3 — Generate")
+    _fmt_parts = ["PDF", "CSV"]
+    if include_plan_png:
+        _fmt_parts.append("plan PNG")
+    if include_report_png:
+        _fmt_parts.append("report PNG")
+    st.caption(f"Outputs per file: {', '.join(_fmt_parts)}.")
 
-    if st.button("🚀  Generate blast report", type="primary", use_container_width=True):
+    if st.button("🚀  Generate blast report", type="primary", width="stretch"):
         results = {}
         progress_bar = st.progress(0, text="Processing...")
         items = list(st.session_state["parsed_data"].items())
@@ -370,39 +508,44 @@ if st.session_state.get("parsed_data"):
                     delay_map=delay_map,
                     **{k: v for k, v in charge_params.items() if k != "diameter_override_mm"},
                 )
+                _, report_csv_rows, _, total_charge = format_charge_table_rows(charge_data)
 
+                plan_settings = dict(settings)
+                plan_settings["show_title"] = False
                 fig_plan, _ = build_figure(
                     pdata["plan_name"], pdata["plan_id"],
                     pdata["holes"], pdata["segments"],
-                    settings, charge_data,
+                    plan_settings, charge_data,
                 )
-                plan_png = _fig_to_png_bytes(fig_plan, output_dpi)
+                plan_png_bytes = _fig_to_png_bytes(fig_plan, output_dpi)
                 plt.close(fig_plan)
-
-                fig_report, report_csv_rows = build_report_figure(
-                    pdata["plan_name"], pdata["plan_id"],
-                    pdata["holes"], pdata["segments"],
-                    settings, charge_data,
-                )
-                report_png = _fig_to_png_bytes(fig_report, output_dpi)
-                plt.close(fig_report)
 
                 pdf_bytes = build_pdf_bytes(
                     pdata["plan_name"], pdata["plan_id"],
                     pdata["holes"], pdata["segments"],
                     settings, charge_data,
                     company=company_name,
+                    plan_png_bytes=plan_png_bytes,
                 )
 
-                total_charge = sum(r["charge_kg"] for r in charge_data)
-                results[base] = {
-                    "plan_png":     plan_png,
-                    "report_png":   report_png,
+                entry = {
                     "pdf":          pdf_bytes,
                     "csv":          _report_csv_bytes(report_csv_rows),
                     "total_charge": total_charge,
                     "n_holes":      len(charge_data),
                 }
+                if include_plan_png:
+                    entry["plan_png"] = plan_png_bytes
+                if include_report_png:
+                    fig_report, _ = build_report_figure(
+                        pdata["plan_name"], pdata["plan_id"],
+                        pdata["holes"], pdata["segments"],
+                        settings, charge_data,
+                    )
+                    entry["report_png"] = _fig_to_png_bytes(fig_report, output_dpi)
+                    plt.close(fig_report)
+
+                results[base] = entry
             except Exception as exc:
                 st.error(f"Error processing **{base}**: {exc}")
 
@@ -410,92 +553,152 @@ if st.session_state.get("parsed_data"):
                                   text=f"Done {i + 1} / {len(items)}")
 
         progress_bar.empty()
-        st.session_state["results"] = results
-        st.rerun()
+        _clear_zip_cache()
+        n_ok = len(results)
+        if results:
+            st.session_state["results"] = results
+            st.session_state["results_formats"] = dict(output_formats)
+        else:
+            st.session_state.pop("results", None)
+            st.session_state.pop("results_formats", None)
+        st.session_state["generate_message"] = (
+            f"Generated {n_ok} blast report{'s' if n_ok != 1 else ''}."
+            if n_ok else "No reports were generated — check errors above."
+        )
 
 
 # ── Results ──────────────────────────────────────────────────────────────────────
 
+_gen_msg = st.session_state.pop("generate_message", None)
 if st.session_state.get("results"):
     results = st.session_state["results"]
+    results_formats = st.session_state.get("results_formats", output_formats)
+    n_zip_files = _zip_entry_count(results, results_formats)
+    zip_bytes = _get_cached_zip_bytes(results, results_formats)
+    zip_size_mb = len(zip_bytes) / (1024 * 1024)
 
     st.divider()
     st.header("Results")
+    if _gen_msg:
+        st.success(_gen_msg)
 
-    # Bulk ZIP download
     zip_name_input = st.text_input("ZIP file name", value="ringblast_output", key="zip_file_name")
     zip_file_name  = (zip_name_input.strip() or "ringblast_output")
     if not zip_file_name.endswith(".zip"):
         zip_file_name += ".zip"
 
-    zip_buf = io.BytesIO()
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for base, data in results.items():
-            zf.writestr(f"plans/{base}.png",              data["plan_png"])
-            zf.writestr(f"reports_png/{base}_report.png", data["report_png"])
-            zf.writestr(f"reports_pdf/{base}_report.pdf", data["pdf"])
-            zf.writestr(f"csv/{base}_charge.csv",         data["csv"])
-    zip_buf.seek(0)
-
-    st.download_button(
-        label=f"⬇  Download all ({len(results)} file{'s' if len(results) != 1 else ''}) as ZIP",
-        data=zip_buf,
-        file_name=zip_file_name,
-        mime="application/zip",
-        use_container_width=True,
-        type="secondary",
-    )
+    dl_zip, dl_merged = st.columns(2)
+    with dl_zip:
+        st.download_button(
+            label=f"⬇  Download all ({n_zip_files} files) as ZIP",
+            data=zip_bytes,
+            file_name=zip_file_name,
+            mime="application/zip",
+            width="stretch",
+            type="secondary",
+        )
+    with dl_merged:
+        if len(results) > 1:
+            st.download_button(
+                label=f"⬇  Combined PDF ({len(results)} plans)",
+                data=_get_cached_merged_pdf_bytes(results, results_formats),
+                file_name="combined_blast_reports.pdf",
+                mime="application/pdf",
+                width="stretch",
+                type="primary",
+            )
+        else:
+            st.download_button(
+                label="⬇  Blast report PDF",
+                data=next(iter(results.values()))["pdf"],
+                file_name=f"{next(iter(results.keys()))}_blast_report.pdf",
+                mime="application/pdf",
+                width="stretch",
+                type="primary",
+            )
+    _zip_note = "ZIP contains `reports_pdf/` and `csv/`"
+    if len(results) > 1:
+        _zip_note += " plus `combined_blast_reports.pdf`"
+    st.caption(_zip_note
+               + ("; `plans/`" if results_formats.get("plan_png") else "")
+               + ("; `reports_png/`" if results_formats.get("report_png") else "")
+               + f" — approx. {zip_size_mb:.1f} MB.")
 
     st.divider()
 
     result_tabs = st.tabs(list(results.keys()))
     for tab, (base, data) in zip(result_tabs, results.items()):
         with tab:
-            # Metrics row
             rm1, rm2 = st.columns(2)
             rm1.metric("Holes charged", data["n_holes"])
             rm2.metric("Total charge",  f"{data['total_charge']:.1f} kg")
 
-            # Image tabs
-            t_plan, t_report = st.tabs(["📐 Drill Plan", "📋 Blast Report"])
-            with t_plan:
-                st.image(data["plan_png"], use_container_width=True)
-            with t_report:
-                st.image(data["report_png"], use_container_width=True)
+            preview_labels = []
+            if data.get("plan_png"):
+                preview_labels.append("📐 Drill plan")
+            if data.get("report_png"):
+                preview_labels.append("📋 Report PNG")
 
-            # Download buttons
+            if preview_labels:
+                preview_tabs = st.tabs(preview_labels)
+                idx = 0
+                if data.get("plan_png"):
+                    with preview_tabs[idx]:
+                        st.image(data["plan_png"], width="stretch")
+                    idx += 1
+                if data.get("report_png"):
+                    with preview_tabs[idx]:
+                        st.image(data["report_png"], width="stretch")
+            else:
+                st.info("Open the **blast report PDF** below. Enable optional PNG outputs in the sidebar to preview images here.")
+
             st.divider()
-            dc1, dc2, dc3, dc4 = st.columns(4)
-            dc1.download_button(
-                label="⬇ Plan PNG",
-                data=data["plan_png"],
-                file_name=f"{base}.png",
-                mime="image/png",
-                key=f"dl_plan_{base}",
-                use_container_width=True,
-            )
-            dc2.download_button(
-                label="⬇ Report PNG",
-                data=data["report_png"],
-                file_name=f"{base}_report.png",
-                mime="image/png",
-                key=f"dl_report_{base}",
-                use_container_width=True,
-            )
-            dc3.download_button(
-                label="⬇ Report PDF",
-                data=data["pdf"],
-                file_name=f"{base}_report.pdf",
-                mime="application/pdf",
-                key=f"dl_pdf_{base}",
-                use_container_width=True,
-            )
-            dc4.download_button(
-                label="⬇ Charge CSV",
-                data=data["csv"],
-                file_name=f"{base}_charge.csv",
-                mime="text/csv",
-                key=f"dl_csv_{base}",
-                use_container_width=True,
-            )
+            dl_cols = st.columns(4)
+            col_i = 0
+            with dl_cols[col_i]:
+                st.download_button(
+                    label="⬇ Blast report PDF",
+                    data=data["pdf"],
+                    file_name=f"{base}_blast_report.pdf",
+                    mime="application/pdf",
+                    key=f"dl_pdf_{base}",
+                    width="stretch",
+                    type="primary",
+                )
+            col_i += 1
+            with dl_cols[col_i]:
+                st.download_button(
+                    label="⬇ Charge CSV",
+                    data=data["csv"],
+                    file_name=f"{base}_charge.csv",
+                    mime="text/csv",
+                    key=f"dl_csv_{base}",
+                    width="stretch",
+                )
+            col_i += 1
+            if data.get("plan_png"):
+                with dl_cols[col_i]:
+                    st.download_button(
+                        label="⬇ Plan PNG",
+                        data=data["plan_png"],
+                        file_name=f"{base}.png",
+                        mime="image/png",
+                        key=f"dl_plan_{base}",
+                        width="stretch",
+                    )
+                col_i += 1
+            if data.get("report_png"):
+                with dl_cols[col_i]:
+                    st.download_button(
+                        label="⬇ Report PNG",
+                        data=data["report_png"],
+                        file_name=f"{base}_report.png",
+                        mime="image/png",
+                        key=f"dl_report_{base}",
+                        width="stretch",
+                    )
+
+elif _gen_msg:
+    st.divider()
+    st.warning(_gen_msg)
 
