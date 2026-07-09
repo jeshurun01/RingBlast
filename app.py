@@ -36,9 +36,13 @@ PREVIEW_MANUAL_MIN_HOLES = 40
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def _parse_uploaded_xml(file_bytes: bytes, filename: str):
+def _parse_uploaded_xml(file_bytes: bytes, filename: str, collar_correction="auto"):
     """Parse XML bytes (cached by content hash)."""
-    return parse_xml(io.BytesIO(file_bytes), filename=filename)
+    return parse_xml(
+        io.BytesIO(file_bytes),
+        filename=filename,
+        collar_correction=collar_correction,
+    )
 
 def _fig_to_png_bytes(fig, dpi):
     buf = io.BytesIO()
@@ -302,6 +306,16 @@ with st.sidebar:
             value=False,
             help="Standalone drill layout image (e.g. for GIS or quick sharing).",
         )
+    with st.expander("🛠  XML corrections", expanded=True):
+        auto_correct_gallery_collars = st.checkbox(
+            "Auto-correct collars when holes converge in gallery void",
+            value=True,
+            help=(
+                "Only activates when StartPoint coordinates are tightly clustered "
+                "near the gallery centre and the hole rays intersect the gallery contour. "
+                "Already-clean XML files are left unchanged."
+            ),
+        )
     with st.expander("Advanced outputs", expanded=False):
         include_report_png = st.checkbox(
             "Report PNG (legacy)",
@@ -352,8 +366,13 @@ uploaded_files = st.file_uploader(
 
 # Parse files when upload list changes
 current_names = [uf.name for uf in uploaded_files] if uploaded_files else []
-if current_names != st.session_state.get("uploaded_names", []):
+current_parse_config = {
+    "names": current_names,
+    "auto_correct_gallery_collars": auto_correct_gallery_collars,
+}
+if current_parse_config != st.session_state.get("uploaded_parse_config", {}):
     st.session_state["uploaded_names"] = current_names
+    st.session_state["uploaded_parse_config"] = current_parse_config
     st.session_state["parsed_data"]    = {}
     st.session_state.pop("results", None)
     st.session_state.pop("results_formats", None)
@@ -370,7 +389,10 @@ if current_names != st.session_state.get("uploaded_names", []):
                 uf.seek(0)
                 file_bytes = uf.read()
                 plan_name, plan_id, holes, segments = _parse_uploaded_xml(
-                    file_bytes, uf.name)
+                    file_bytes,
+                    uf.name,
+                    collar_correction="auto" if auto_correct_gallery_collars else "off",
+                )
                 st.session_state["parsed_data"][base] = {
                     "plan_name": plan_name, "plan_id": plan_id,
                     "holes": holes, "segments": segments,

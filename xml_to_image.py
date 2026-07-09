@@ -73,8 +73,107 @@ def _text(elem, tag):
     return child.text if child is not None else None
 
 
-def parse_xml(xml_source, filename=None):
-    """Parse xml_source (file path string or file-like object)."""
+def _cross(ax, ay, bx, by):
+    return ax * by - ay * bx
+
+
+def _ray_segment_intersection_t(sx, sy, ex, ey, ax, ay, bx, by):
+    """Return t on S + t*(E-S) for a ray/segment intersection, else None."""
+    rx, ry = ex - sx, ey - sy
+    vx, vy = bx - ax, by - ay
+    qpx, qpy = ax - sx, ay - sy
+    denom = _cross(rx, ry, vx, vy)
+    if abs(denom) < 1e-9:
+        return None
+    t = _cross(qpx, qpy, vx, vy) / denom
+    u = _cross(qpx, qpy, rx, ry) / denom
+    if 1e-9 < t < 1.0 - 1e-9 and -1e-9 <= u <= 1.0 + 1e-9:
+        return t
+    return None
+
+
+def _nearest_contour_intersection(sx, sy, ex, ey, segments):
+    candidates = []
+    for x1, y1, x2, y2 in segments:
+        t = _ray_segment_intersection_t(sx, sy, ex, ey, x1, y1, x2, y2)
+        if t is not None:
+            candidates.append(t)
+    if not candidates:
+        return None
+    t = min(candidates)
+    return sx + t * (ex - sx), sy + t * (ey - sy), t
+
+
+def _starts_are_clustered(holes, max_radius_m=1.5):
+    if len(holes) < 2:
+        return False
+    cx = sum(h["x1"] for h in holes) / len(holes)
+    cy = sum(h["y1"] for h in holes) / len(holes)
+    distances = [math.hypot(h["x1"] - cx, h["y1"] - cy) for h in holes]
+    return max(distances) <= max_radius_m
+
+
+def _correct_convergent_gallery_center_collars(holes, segments, mode="auto"):
+    """Move hole starts to contour only when starts converge in gallery void.
+
+    Deswik exports can place every StartPoint at the ring centre inside the gallery.
+    In that case the technical report overstates drilled length because it includes
+    the void between gallery centre and wall. Auto mode corrects only this pattern:
+    starts are tightly clustered and most holes have a contour intersection at least
+    0.5 m away from the original start.
+    """
+    if mode in (False, None, "off", "none") or not holes or not segments:
+        return holes
+
+    corrected = []
+    move_count = 0
+    hit_count = 0
+    for h in holes:
+        hit = _nearest_contour_intersection(h["x1"], h["y1"], h["x2"], h["y2"], segments)
+        if hit is None:
+            corrected.append(dict(h))
+            continue
+        nx, ny, _t = hit
+        hit_count += 1
+        moved = math.hypot(nx - h["x1"], ny - h["y1"])
+        nh = dict(h)
+        nh["_contour_x1"] = nx
+        nh["_contour_y1"] = ny
+        nh["_collar_move_m"] = moved
+        corrected.append(nh)
+        if moved >= 0.5:
+            move_count += 1
+
+    if mode in (True, "always", "force"):
+        should_apply = hit_count == len(holes)
+    else:
+        enough_hits = hit_count >= max(2, math.ceil(len(holes) * 0.6))
+        enough_moves = move_count >= max(2, math.ceil(len(holes) * 0.6))
+        should_apply = enough_hits and enough_moves and _starts_are_clustered(holes)
+
+    if not should_apply:
+        return holes
+
+    applied = []
+    for h in corrected:
+        nh = dict(h)
+        if "_contour_x1" in nh:
+            nh["x1"] = nh.pop("_contour_x1")
+            nh["y1"] = nh.pop("_contour_y1")
+            nh.pop("_collar_move_m", None)
+            depth = math.hypot(nh["x2"] - nh["x1"], nh["y2"] - nh["y1"])
+            nh["label"] = _format_hole_label(nh["name"], nh["id"], depth)
+        applied.append(nh)
+    return applied
+
+
+def parse_xml(xml_source, filename=None, collar_correction="auto"):
+    """Parse xml_source (file path string or file-like object).
+
+    collar_correction="auto" fixes Deswik-style gallery-centre StartPoints only
+    when the holes visibly converge to a tight centre point in gallery void.
+    Pass False to keep original XML coordinates.
+    """
     tree = ET.parse(xml_source)
     root = tree.getroot()
 
@@ -123,6 +222,8 @@ def parse_xml(xml_source, filename=None):
         x2 = float(_text(ep, "ir:PointX"))
         y2 = float(_text(ep, "ir:PointY"))
         segments.append((x1, y1, x2, y2))
+
+    holes = _correct_convergent_gallery_center_collars(holes, segments, collar_correction)
 
     return plan_name, plan_id, holes, segments
 
