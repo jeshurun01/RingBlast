@@ -167,12 +167,12 @@ def _correct_convergent_gallery_center_collars(holes, segments, mode="auto"):
     return applied
 
 
-def parse_xml(xml_source, filename=None, collar_correction="auto"):
+def parse_xml(xml_source, filename=None, collar_correction="off"):
     """Parse xml_source (file path string or file-like object).
 
     collar_correction="auto" fixes Deswik-style gallery-centre StartPoints only
     when the holes visibly converge to a tight centre point in gallery void.
-    Pass False to keep original XML coordinates.
+    Correction is opt-in. Pass "auto" to enable conservative detection.
     """
     tree = ET.parse(xml_source)
     root = tree.getroot()
@@ -625,7 +625,7 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data,
 
     if plan_h_if_all >= MIN_PLAN_H:
         PLAN_H  = plan_h_if_all
-        pages   = [[COL_LABELS] + all_data_rows + [TOTALS_ROW]]
+        pages   = [([COL_LABELS] + all_data_rows + [TOTALS_ROW], True)]
     else:
         PLAN_H  = MIN_PLAN_H
         _max_tbl_h_p1 = _below_info_avail - 2 * GAP - PLAN_H
@@ -633,11 +633,12 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data,
         _overhead_pN  = MARGIN + HEADER_H + GAP + MARGIN
         max_rows_pN   = max(5, int((PAGE_H - _overhead_pN) / ROW_H) - 2)
 
-        pages = [[COL_LABELS] + all_data_rows[:max_rows_p1] + [TOTALS_ROW]]
+        pages = [([COL_LABELS] + all_data_rows[:max_rows_p1], False)]
         remaining = all_data_rows[max_rows_p1:]
         while remaining:
             chunk, remaining = remaining[:max_rows_pN], remaining[max_rows_pN:]
-            pages.append([COL_LABELS] + chunk + ([TOTALS_ROW] if not remaining else []))
+            has_totals = not remaining
+            pages.append(([COL_LABELS] + chunk + ([TOTALS_ROW] if has_totals else []), has_totals))
 
     # ── Plan image (reuse caller PNG when provided) ───────────────────────────
     if plan_png_bytes:
@@ -671,8 +672,8 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data,
     C_GRID     = _c("#aaaaaa")
     C_BORDER   = _c("#888888")
 
-    def _table_style(tbl_rows):
-        n_data = len(tbl_rows) - 2
+    def _table_style(tbl_rows, has_totals):
+        n_data = len(tbl_rows) - 1 - int(has_totals)
         cmds = [
             ("FONTSIZE",      (0, 0), (-1, -1),   7.5),
             ("VALIGN",        (0, 0), (-1, -1),   "MIDDLE"),
@@ -684,10 +685,14 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data,
             ("FONTNAME",      (0, 0), (-1, 0),    "Helvetica-Bold"),
             ("BACKGROUND",    (3, 0), (3, 0),     C_ACT_HDR),
             ("BACKGROUND",    (7, 0), (7, 0),     C_ACT_HDR),
-            ("FONTNAME",      (0, 1), (-1, -2),   "Helvetica"),
-            ("BACKGROUND",    (0, -1), (-1, -1),  C_TOTALS),
-            ("FONTNAME",      (0, -1), (-1, -1),  "Helvetica-Bold"),
         ]
+        if n_data:
+            cmds.append(("FONTNAME", (0, 1), (-1, n_data), "Helvetica"))
+        if has_totals:
+            cmds.extend([
+                ("BACKGROUND", (0, -1), (-1, -1), C_TOTALS),
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ])
         for r in range(1, n_data + 1):
             cmds.append(("BACKGROUND", (0, r), (-1, r), C_EVEN if r % 2 == 0 else C_ODD))
             cmds.append(("BACKGROUND", (3, r), (3, r), C_ACT_DATA))
@@ -703,7 +708,7 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data,
     c     = rl_canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
     today = datetime.date.today().strftime("%Y-%m-%d")
 
-    for page_idx, tbl_rows in enumerate(pages):
+    for page_idx, (tbl_rows, has_totals) in enumerate(pages):
         is_first = (page_idx == 0)
 
         c.setFillColor(C_BG)
@@ -798,7 +803,7 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data,
 
         # ── Charge table ──────────────────────────────────────────────────────
         tbl = Table(tbl_rows, colWidths=COL_WIDTHS, rowHeights=ROW_H)
-        tbl.setStyle(_table_style(tbl_rows))
+        tbl.setStyle(_table_style(tbl_rows, has_totals))
         tbl.wrapOn(c, CONTENT_W, tbl_h)
         tbl.drawOn(c, MARGIN, tbl_bottom)
 
