@@ -9,7 +9,6 @@ import csv
 import hashlib
 import io
 import math
-import os
 import zipfile
 
 import matplotlib
@@ -18,6 +17,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+from app_utils import csv_safe_cell, unique_upload_base, upload_fingerprint
 from xml_to_image import (
     build_charge_table,
     build_figure,
@@ -67,7 +67,7 @@ def _report_csv_bytes(report_csv_rows):
     writer.writerow(["Number", "Diameter (mm)", "Length (m)", "Actual meters",
                      "Stemming (m)", "Charge length (m)", "Charge (kg)",
                      "Actual charge", "Delay (ms)"])
-    writer.writerows(report_csv_rows)
+    writer.writerows([[csv_safe_cell(cell) for cell in row] for row in report_csv_rows])
     return buf.getvalue().encode()
 
 
@@ -309,7 +309,7 @@ with st.sidebar:
     with st.expander("🛠  XML corrections", expanded=True):
         auto_correct_gallery_collars = st.checkbox(
             "Auto-correct collars when holes converge in gallery void",
-            value=True,
+            value=False,
             help=(
                 "Only activates when StartPoint coordinates are tightly clustered "
                 "near the gallery centre and the hole rays intersect the gallery contour. "
@@ -364,14 +364,13 @@ uploaded_files = st.file_uploader(
     label_visibility="collapsed",
 )
 
-# Parse files when upload list changes
-current_names = [uf.name for uf in uploaded_files] if uploaded_files else []
+# Parse files when upload names or contents change.
+upload_payloads = [(uf.name, uf.getvalue()) for uf in uploaded_files] if uploaded_files else []
 current_parse_config = {
-    "names": current_names,
+    "files": upload_fingerprint(upload_payloads),
     "auto_correct_gallery_collars": auto_correct_gallery_collars,
 }
 if current_parse_config != st.session_state.get("uploaded_parse_config", {}):
-    st.session_state["uploaded_names"] = current_names
     st.session_state["uploaded_parse_config"] = current_parse_config
     st.session_state["parsed_data"]    = {}
     st.session_state.pop("results", None)
@@ -383,14 +382,13 @@ if current_parse_config != st.session_state.get("uploaded_parse_config", {}):
 
     if uploaded_files:
         errors = []
-        for uf in uploaded_files:
-            base = os.path.splitext(uf.name)[0]
+        used_bases = set()
+        for (original_name, file_bytes) in upload_payloads:
+            base = unique_upload_base(original_name, used_bases)
             try:
-                uf.seek(0)
-                file_bytes = uf.read()
                 plan_name, plan_id, holes, segments = _parse_uploaded_xml(
                     file_bytes,
-                    uf.name,
+                    f"{base}.XML",
                     collar_correction="auto" if auto_correct_gallery_collars else "off",
                 )
                 st.session_state["parsed_data"][base] = {
@@ -398,7 +396,7 @@ if current_parse_config != st.session_state.get("uploaded_parse_config", {}):
                     "holes": holes, "segments": segments,
                 }
             except Exception as exc:
-                errors.append(f"**{uf.name}**: {exc}")
+                errors.append(f"**{base}.XML**: {exc}")
         for e in errors:
             st.error(e)
 

@@ -65,3 +65,11 @@ def test_collar_correction_can_be_disabled_for_original_coordinates():
     _, _, holes, _ = parse_xml(io.BytesIO(xml_bytes), filename="disabled.XML", collar_correction=False)
 
     assert [(h["x1"], h["y1"]) for h in holes] == [(0.0, 0.0), (0.0, 0.0)]
+
+
+def test_collar_correction_is_opt_in_by_default():
+    xml_bytes = _xml([(0, 0, -10, 0), (0, 0, 9, 0)])
+
+    _, _, holes, _ = parse_xml(io.BytesIO(xml_bytes), filename="default.XML")
+
+    assert [(h["x1"], h["y1"]) for h in holes] == [(0.0, 0.0), (0.0, 0.0)]
