@@ -2,7 +2,13 @@ import io
 
 from pypdf import PdfReader
 
-from app_utils import csv_safe_cell, safe_upload_base, unique_upload_base, upload_fingerprint
+from app_utils import (
+    csv_safe_cell,
+    safe_upload_base,
+    selected_plan_data,
+    unique_upload_base,
+    upload_fingerprint,
+)
 from xml_to_image import build_charge_table, build_pdf_bytes, parse_xml
 
 
@@ -81,3 +87,10 @@ def test_csv_safe_cell_escapes_spreadsheet_formula_prefixes():
         assert csv_safe_cell(value) == "'" + value
     assert csv_safe_cell("H1") == "H1"
     assert csv_safe_cell(12.5) == 12.5
+
+
+def test_selected_plan_data_preserves_upload_order_and_ignores_unknown_names():
+    parsed = {"R0": {"holes": [0]}, "R2": {"holes": [2]}, "R3": {"holes": [3]}}
+
+    assert list(selected_plan_data(parsed, ["R3", "missing", "R0"])) == ["R0", "R3"]
+    assert selected_plan_data(parsed, []) == {}

@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-from app_utils import csv_safe_cell, unique_upload_base, upload_fingerprint
+from app_utils import csv_safe_cell, selected_plan_data, unique_upload_base, upload_fingerprint
 from xml_to_image import (
     build_charge_table,
     build_figure,
@@ -26,6 +26,7 @@ from xml_to_image import (
     merge_pdf_bytes,
     compute_stemming,
     format_charge_table_rows,
+    hole_length,
     parse_xml,
 )
 
@@ -185,6 +186,8 @@ def _render_plan_preview(base, pdata, edited, settings, charge_params):
 
 def _plan_preview_panel(base, pdata, edited, settings, charge_params):
     """Live plan preview — re-renders when table or style inputs change."""
+    orientation_label = "Vue de dessus" if settings.get("view_orientation") == "top" else "Vue de dessous"
+    st.caption(f"Projection XY — **{orientation_label}**")
     n_holes = len(pdata["holes"])
     phash = _preview_hash(edited, settings, charge_params)
     hash_cache_key = f"preview_hash_{base}"
@@ -209,7 +212,7 @@ def _build_default_hole_df(holes, charge_params):
     rows = []
     dia_override = charge_params.get("diameter_override_mm", 0)
     for h in holes:
-        depth = math.hypot(h["x2"] - h["x1"], h["y2"] - h["y1"])
+        depth = hole_length(h)
         diameter = dia_override if dia_override > 0 else int(h["diameter_mm"])
         stemming = compute_stemming(
             depth, diameter,
@@ -344,6 +347,7 @@ settings = {
     "scale_bar_length":  scale_bar_length,
     "fig_width":         fig_width,
     "fig_height":        fig_height,
+    "view_orientation":  "top",
 }
 
 charge_params = {
@@ -379,6 +383,7 @@ if current_parse_config != st.session_state.get("uploaded_parse_config", {}):
     for key in [k for k in st.session_state
                 if k.startswith(("df_", "edited_", "de_", "preview_"))]:
         del st.session_state[key]
+    st.session_state.pop("selected_xml_names", None)
 
     if uploaded_files:
         errors = []
@@ -400,24 +405,56 @@ if current_parse_config != st.session_state.get("uploaded_parse_config", {}):
         for e in errors:
             st.error(e)
 
-# Show upload summary
+# Show upload summary and explicit visualisation controls.
+selected_data = {}
 if st.session_state.get("parsed_data"):
-    n_files = len(st.session_state["parsed_data"])
-    n_holes = sum(len(v["holes"]) for v in st.session_state["parsed_data"].values())
+    parsed_data = st.session_state["parsed_data"]
+    n_files = len(parsed_data)
+    n_holes = sum(len(v["holes"]) for v in parsed_data.values())
     st.success(f"{n_files} file{'s' if n_files > 1 else ''} loaded — {n_holes} holes total")
+
+    st.subheader("Visualisation des plans")
+    select_col, view_col = st.columns([3, 2], gap="large")
+    with select_col:
+        selected_names = st.multiselect(
+            "Fichiers XML à afficher et à générer",
+            options=list(parsed_data),
+            default=list(parsed_data),
+            key="selected_xml_names",
+            help="Les fichiers non sélectionnés restent chargés, mais ne sont ni affichés ni générés.",
+        )
+    with view_col:
+        orientation_label = st.radio(
+            "Orientation de la projection XY",
+            options=["Vue de dessus", "Vue de dessous"],
+            horizontal=True,
+            help="La vue de dessous regarde vers le haut et inverse l'axe X.",
+        )
+    settings["view_orientation"] = "top" if orientation_label == "Vue de dessus" else "bottom"
+    selected_data = selected_plan_data(parsed_data, selected_names)
+
+    display_config = (tuple(selected_names), settings["view_orientation"])
+    if display_config != st.session_state.get("display_config"):
+        st.session_state["display_config"] = display_config
+        st.session_state.pop("results", None)
+        st.session_state.pop("results_formats", None)
+        _clear_zip_cache()
+
+    if not selected_data:
+        st.info("Sélectionnez au moins un fichier XML pour afficher les trous.")
 
 # ── Step 2 & 3 side by side ──────────────────────────────────────────────────────
 
-if st.session_state.get("parsed_data"):
+if selected_data:
     st.divider()
     st.subheader("Step 2 — Edit hole data")
     st.caption("Stemming is auto-calculated from the sidebar parameters. "
                "Override per hole as needed and set delays — "
                "the plan preview on the right updates as you edit.")
 
-    file_tabs = st.tabs(list(st.session_state["parsed_data"].keys()))
+    file_tabs = st.tabs(list(selected_data.keys()))
 
-    for tab, (base, pdata) in zip(file_tabs, st.session_state["parsed_data"].items()):
+    for tab, (base, pdata) in zip(file_tabs, selected_data.items()):
         with tab:
             df_key = f"df_{base}"
             if df_key not in st.session_state:
@@ -500,7 +537,7 @@ if st.session_state.get("parsed_data"):
     if st.button("🚀  Generate blast report", type="primary", width="stretch"):
         results = {}
         progress_bar = st.progress(0, text="Processing...")
-        items = list(st.session_state["parsed_data"].items())
+        items = list(selected_data.items())
 
         for i, (base, pdata) in enumerate(items):
             progress_bar.progress(i / len(items), text=f"Processing {base}…")

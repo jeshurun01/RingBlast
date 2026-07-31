@@ -39,6 +39,12 @@ def upload_fingerprint(files: Iterable[tuple[str, bytes]]) -> tuple[tuple[str, s
     )
 
 
+def selected_plan_data(parsed_data: dict, selected_names: Iterable[str]) -> dict:
+    """Return selected parsed plans in their original upload order."""
+    selected = set(selected_names)
+    return {name: data for name, data in parsed_data.items() if name in selected}
+
+
 def csv_safe_cell(value):
     """Prevent spreadsheet software from interpreting XML-controlled text as formulas."""
     if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):

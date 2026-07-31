@@ -73,3 +73,28 @@ def test_collar_correction_is_opt_in_by_default():
     _, _, holes, _ = parse_xml(io.BytesIO(xml_bytes), filename="default.XML")
 
     assert [(h["x1"], h["y1"]) for h in holes] == [(0.0, 0.0), (0.0, 0.0)]
+
+
+def test_auto_collar_correction_interpolates_z_at_contour_intersection():
+    xml_bytes = _xml([(0, 0, 10, 0), (0, 0, -10, 0)])
+    xml_bytes = xml_bytes.replace(
+        b"<IR:PointZ>0</IR:PointZ></EndPoint>",
+        b"<IR:PointZ>10</IR:PointZ></EndPoint>",
+    )
+
+    _, _, holes, _ = parse_xml(
+        io.BytesIO(xml_bytes),
+        filename="inclined.XML",
+        collar_correction="auto",
+    )
+
+    assert math.isclose(holes[0]["x1"], 3.0, abs_tol=1e-6)
+    assert math.isclose(holes[0]["z1"], 3.0, abs_tol=1e-6)
+    assert math.isclose(
+        math.dist(
+            (holes[0]["x1"], holes[0]["y1"], holes[0]["z1"]),
+            (holes[0]["x2"], holes[0]["y2"], holes[0]["z2"]),
+        ),
+        math.sqrt(98),
+        abs_tol=1e-6,
+    )

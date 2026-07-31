@@ -73,6 +73,52 @@ def _text(elem, tag):
     return child.text if child is not None else None
 
 
+def _point_coordinates(point, context):
+    """Read an iRedes point, accepting omitted Z as a legacy 2D coordinate."""
+    try:
+        coordinates = (
+            float(_text(point, "ir:PointX")),
+            float(_text(point, "ir:PointY")),
+            float(_text(point, "ir:PointZ") or 0.0),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"coordonnées invalides pour {context}") from exc
+    if not all(math.isfinite(value) for value in coordinates):
+        raise ValueError(f"les coordonnées de {context} doivent être finies")
+    return coordinates
+
+
+def hole_length(hole):
+    """Return the real 3D hole length (legacy 2D holes default to Z=0)."""
+    return math.sqrt(
+        (hole["x2"] - hole["x1"]) ** 2
+        + (hole["y2"] - hole["y1"]) ** 2
+        + (hole.get("z2", 0.0) - hole.get("z1", 0.0)) ** 2
+    )
+
+
+def project_plan(holes, segments, orientation="top"):
+    """Project a plan on XY as seen from above or from below.
+
+    A bottom view looks upward along +Z, so X is mirrored while Y remains up.
+    Copies are returned to keep parsed coordinates unchanged.
+    """
+    if orientation not in ("top", "bottom"):
+        raise ValueError("orientation attendue: 'top' ou 'bottom'")
+    x_sign = 1.0 if orientation == "top" else -1.0
+    projected_holes = []
+    for hole in holes:
+        projected = dict(hole)
+        projected["x1"] = x_sign * hole["x1"]
+        projected["x2"] = x_sign * hole["x2"]
+        projected_holes.append(projected)
+    projected_segments = [
+        (x_sign * x1, y1, x_sign * x2, y2)
+        for x1, y1, x2, y2 in segments
+    ]
+    return projected_holes, projected_segments
+
+
 def _cross(ax, ay, bx, by):
     return ax * by - ay * bx
 
@@ -133,12 +179,13 @@ def _correct_convergent_gallery_center_collars(holes, segments, mode="auto"):
         if hit is None:
             corrected.append(dict(h))
             continue
-        nx, ny, _t = hit
+        nx, ny, t = hit
         hit_count += 1
         moved = math.hypot(nx - h["x1"], ny - h["y1"])
         nh = dict(h)
         nh["_contour_x1"] = nx
         nh["_contour_y1"] = ny
+        nh["_contour_t"] = t
         nh["_collar_move_m"] = moved
         corrected.append(nh)
         if moved >= 0.5:
@@ -160,8 +207,12 @@ def _correct_convergent_gallery_center_collars(holes, segments, mode="auto"):
         if "_contour_x1" in nh:
             nh["x1"] = nh.pop("_contour_x1")
             nh["y1"] = nh.pop("_contour_y1")
+            t = nh.pop("_contour_t")
+            nh["z1"] = nh.get("z1", 0.0) + t * (
+                nh.get("z2", 0.0) - nh.get("z1", 0.0)
+            )
             nh.pop("_collar_move_m", None)
-            depth = math.hypot(nh["x2"] - nh["x1"], nh["y2"] - nh["y1"])
+            depth = hole_length(nh)
             nh["label"] = _format_hole_label(nh["name"], nh["id"], depth)
         applied.append(nh)
     return applied
@@ -190,24 +241,28 @@ def parse_xml(xml_source, filename=None, collar_correction="off"):
         if sp is None or ep is None:
             continue
 
-        x1 = float(_text(sp, "ir:PointX"))
-        y1 = float(_text(sp, "ir:PointY"))
-        x2 = float(_text(ep, "ir:PointX"))
-        y2 = float(_text(ep, "ir:PointY"))
+        x1, y1, z1 = _point_coordinates(sp, "StartPoint")
+        x2, y2, z2 = _point_coordinates(ep, "EndPoint")
 
-        drill_dia = float(_text(hole, "drp:DrillBitDia") or 0)
+        try:
+            drill_dia = float(_text(hole, "drp:DrillBitDia") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("diamètre de forage invalide") from exc
+        if not math.isfinite(drill_dia) or drill_dia < 0:
+            raise ValueError("le diamètre de forage doit être fini et positif")
         if drill_dia == 0:
             continue
 
         hole_id   = _text(hole, "drp:HoleId")   or ""
         hole_name = _text(hole, "drp:HoleName") or ""
-        distance  = math.hypot(x2 - x1, y2 - y1)
+        distance = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
         display = _hole_display_name(hole_name, hole_id)
         label = _format_hole_label(hole_name, hole_id, distance)
 
         holes.append({
             "id": hole_id, "name": hole_name, "display": display, "label": label,
-            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "x1": x1, "y1": y1, "z1": z1,
+            "x2": x2, "y2": y2, "z2": z2,
             "diameter_mm": drill_dia,
         })
 
@@ -217,11 +272,12 @@ def parse_xml(xml_source, filename=None, collar_correction="off"):
         ep = line.find("ir:EndPoint",   NS)
         if sp is None or ep is None:
             continue
-        x1 = float(_text(sp, "ir:PointX"))
-        y1 = float(_text(sp, "ir:PointY"))
-        x2 = float(_text(ep, "ir:PointX"))
-        y2 = float(_text(ep, "ir:PointY"))
+        x1, y1, _ = _point_coordinates(sp, "Line/StartPoint")
+        x2, y2, _ = _point_coordinates(ep, "Line/EndPoint")
         segments.append((x1, y1, x2, y2))
+
+    if not holes:
+        raise ValueError("aucun trou exploitable trouvé dans ce fichier iRedes DRPPlan")
 
     holes = _correct_convergent_gallery_center_collars(holes, segments, collar_correction)
 
@@ -271,7 +327,7 @@ def build_charge_table(holes, stemming_overrides=None, delay_map=None,
     rows = []
     for h in holes:
         hole_key    = h.get("display") or h["name"] or h["id"]
-        depth_m     = math.hypot(h["x2"] - h["x1"], h["y2"] - h["y1"])
+        depth_m     = hole_length(h)
         diameter_mm = diameter_overrides.get(hole_key, h.get("diameter_mm", 89.0))
 
         override = stemming_overrides.get(hole_key)
@@ -370,6 +426,8 @@ def _draw_scale_bar(ax, x_left, y_bottom, bar_length=5.0):
 
 def _draw_plan_on_ax(ax, plan_id, holes, segments, settings, charge_data=None):
     """Draw the drill plan (+ optional charge overlay) onto an existing axes."""
+    orientation = settings.get("view_orientation", "top")
+    holes, segments = project_plan(holes, segments, orientation)
     c_hole   = settings.get("color_hole",        COLOR_HOLE)
     c_out    = settings.get("color_outline",     COLOR_OUTLINE)
     c_dot    = settings.get("color_dot",         COLOR_DOT)
@@ -385,6 +443,7 @@ def _draw_plan_on_ax(ax, plan_id, holes, segments, settings, charge_data=None):
 
     title_parts = plan_id.replace("_", " ").replace("-", " - ").split()
     title = " ".join(p.capitalize() if p.isalpha() else p for p in title_parts)
+    title += " — Vue de dessus" if orientation == "top" else " — Vue de dessous"
 
     ax.set_aspect("equal")
     ax.set_facecolor(c_bg)
@@ -494,7 +553,7 @@ def build_figure(plan_name, plan_id, holes, segments, settings, charge_data=None
 
     csv_rows = []
     for h in holes:
-        depth = math.hypot(h["x2"] - h["x1"], h["y2"] - h["y1"])
+        depth = hole_length(h)
         csv_rows.append([h.get("display") or h["name"] or h["id"], f"{depth:.3f}"])
     return fig, csv_rows
 
