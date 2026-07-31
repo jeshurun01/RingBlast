@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-from app_utils import csv_safe_cell, selected_plan_data, unique_upload_base, upload_fingerprint
+from app_utils import csv_safe_cell, unique_upload_base, upload_fingerprint
 from xml_to_image import (
     build_charge_table,
     build_figure,
@@ -431,7 +431,8 @@ if st.session_state.get("parsed_data"):
             help="La vue de dessous regarde vers le haut et inverse l'axe X.",
         )
     settings["view_orientation"] = "top" if orientation_label == "Vue de dessus" else "bottom"
-    selected_data = selected_plan_data(parsed_data, selected_names)
+    selected = set(selected_names)
+    selected_data = {name: data for name, data in parsed_data.items() if name in selected}
 
     display_config = (tuple(selected_names), settings["view_orientation"])
     if display_config != st.session_state.get("display_config"):
