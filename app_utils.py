@@ -8,6 +8,16 @@ import re
 from collections.abc import Iterable
 
 _FORMULA_PREFIXES = ("=", "+", "-", "@")
+_DEFAULT_COMBINED_REPORT = "combined_blast_reports.pdf"
+
+
+def combined_report_filename(name: str | None) -> str:
+    """Return a safe PDF filename for a combined report download/archive entry."""
+    raw = str(name or "").strip()
+    if raw.lower().endswith(".pdf"):
+        raw = raw[:-4]
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-")[:120].rstrip("._-")
+    return f"{safe}.pdf" if safe else _DEFAULT_COMBINED_REPORT
 
 
 def safe_upload_base(filename: str) -> str:
