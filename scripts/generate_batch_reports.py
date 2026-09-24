@@ -6,11 +6,14 @@ Uses the SAME report-generation path as the Streamlit app:
 with the app's DEFAULT charge parameters and visual settings, so the output
 matches what the web UI would produce for the same XMLs.
 
-Deliverables for a batch of iRedes DRPPlan XMLs:
-  1. combined_blast_reports.pdf      -- per-ring blast report, one PDF merged
-     Use --combined-name to choose a descriptive, safely sanitized name.
-  2. top_view_all_rings.pdf          -- ONE page: top view of every ring
-  3. individual PDFs + charge CSVs   -- reports_pdf/ and csv/ (ZIP package)
+Deliverables for a batch of iRedes DRPPlan XMLs (default names use the batch
+stope label derived from the input XML names, e.g. B27_S8):
+  1. <STOPE>_Combined_RingBlast_Report.pdf -- per-ring blast report, one PDF
+     merged. Use --combined-name to choose a descriptive, safely sanitized
+     name instead.
+  2. <STOPE>_Top_View_All_Rings.pdf       -- ONE page: top view of every ring
+  3. <STOPE>_RingBlast_Report_Package.zip -- individual PDFs + charge CSVs
+     (reports_pdf/, csv/) + the combined report + the top view + summary
 
 Usage:
     .venv/bin/python scripts/generate_batch_reports.py \
@@ -41,7 +44,11 @@ from xml_to_image import (
     parse_xml,
     project_plan,
 )
-from app_utils import combined_report_filename
+from app_utils import (
+    batch_stope_label,
+    combined_report_filename,
+    stope_label_from_name,
+)
 
 # ── App defaults (must match app.py sidebar defaults) ─────────────────────────
 DEFAULT_SETTINGS = {
@@ -81,8 +88,34 @@ def ring_key(base):
 
 def ring_label(base):
     """Return the compact ring identifier used in the top-view columns."""
-    number = ring_key(base)[0]
-    return f"R{number}" if number else base
+    import re
+    match = re.search(r"R(\d+)(?:_|$)", base, re.IGNORECASE)
+    return f"R{int(match.group(1))}" if match else base
+
+
+def batch_label(entries):
+    """One stope/batch label for the whole batch (B27_S8_R1..R10 -> B27_S8).
+
+    Input XML names are the primary source; a plan id ("B27 S8_R1") is used
+    when a file name carries no stope information (e.g. a bare ``R3.XML``).
+    """
+    names = [stope_label_from_name(entry["base"]) or entry.get("plan_id") or ""
+             for entry in entries]
+    names = [name for name in names if str(name).strip()]
+    return batch_stope_label(names)
+
+
+def batch_artifact_names(stope, combined_name=None):
+    """Final artifact file names for one batch (combined, top view, package)."""
+    combined = combined_report_filename(
+        combined_name or f"{stope}_Combined_RingBlast_Report"
+    )
+    return {
+        "batch_label": stope,
+        "combined_pdf": combined,
+        "top_view_pdf": f"{stope}_Top_View_All_Rings.pdf",
+        "package_zip": f"{stope}_RingBlast_Report_Package.zip",
+    }
 
 
 def custom_stemming_overrides(entry, start_ring, default_m=2.0,
@@ -215,7 +248,9 @@ def main():
     ap.add_argument("-o", "--output", default="generated_reports", help="output dir")
     ap.add_argument(
         "--combined-name",
-        help="combined PDF name (default: combined_blast_reports.pdf; invalid characters become underscores)",
+        help="combined PDF name (default: <STOPE>_Combined_RingBlast_Report.pdf, "
+             "with the stope label derived from the input XML names; "
+             "invalid characters become underscores)",
     )
     ap.add_argument("--collar-correction", choices=["off", "auto"], default="off",
                     help="gallery-collar auto-correction (default off, matching the app)")
@@ -237,6 +272,13 @@ def main():
     os.makedirs(args.output, exist_ok=True)
     entries = parse_batch(xml_files, collar_correction=args.collar_correction)
     print(f"Parsed {len(entries)} XML(s)")
+
+    stope = batch_label(entries)
+    names = batch_artifact_names(stope, combined_name=args.combined_name)
+    combined_filename = names["combined_pdf"]
+    top_filename = names["top_view_pdf"]
+    zip_filename = names["package_zip"]
+    print(f"Batch label    : {stope}")
 
     settings = dict(DEFAULT_SETTINGS)
     charge_params = dict(DEFAULT_CHARGE_PARAMS)
@@ -276,13 +318,12 @@ def main():
 
     # 1) Combined PDF (all rings, one file)
     combined = merge_pdf_bytes(pdf_bytes[e["base"]] for e in entries)
-    combined_filename = combined_report_filename(args.combined_name)
     combined_path = os.path.join(args.output, combined_filename)
     with open(combined_path, "wb") as f:
         f.write(combined)
 
     # 2) Single-page top view of all rings
-    top_path = os.path.join(args.output, "top_view_all_rings.pdf")
+    top_path = os.path.join(args.output, top_filename)
     png_tmp = os.path.join(args.output, "_top_view_all_rings.png")
     build_top_view_grid(entries, settings, png_tmp)
     # embed PNG into a one-page A3 landscape PDF
@@ -301,17 +342,31 @@ def main():
     c.showPage()
     c.save()
 
-    # 3) Individual PDFs + CSVs + combined + summary -> ZIP package
-    zip_path = os.path.join(args.output, "ringblast_reports_package.zip")
+    # 3) Individual PDFs + CSVs + combined + top view + summary -> ZIP package
+    zip_path = os.path.join(args.output, zip_filename)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.write(combined_path, f"reports_pdf/{combined_filename}")
         for e in entries:
             zf.writestr(f"reports_pdf/{e['base']}_blast_report.pdf", pdf_bytes[e["base"]])
             zf.writestr(f"csv/{e['base']}_charge.csv", csv_bytes[e["base"]])
-        zf.writestr("top_view/top_view_all_rings.pdf", open(top_path, "rb").read())
+        zf.writestr(f"top_view/{top_filename}", open(top_path, "rb").read())
         zf.writestr("generation_summary.json", json.dumps({
             "source_zip": os.path.basename(args.xml[0]).split(".")[0],
+            "source_files": [os.path.basename(e["path"]) for e in entries],
+            "source_count": len(entries),
+            "batch_label": stope,
             "combined_pdf": combined_filename,
+            "artifact_names": {
+                "batch_label": stope,
+                "combined_pdf": combined_filename,
+                "top_view_pdf": top_filename,
+                "package_zip": zip_filename,
+                "zip_combined_entry": f"reports_pdf/{combined_filename}",
+                "zip_top_view_entry": f"top_view/{top_filename}",
+                "per_ring_reports": [f"reports_pdf/{e['base']}_blast_report.pdf" for e in entries],
+                "per_ring_csvs": [f"csv/{e['base']}_charge.csv" for e in entries],
+                "summary": "generation_summary.json",
+            },
             "rings": summaries,
             "settings": settings,
             "charge_params": charge_params,
@@ -332,9 +387,13 @@ def main():
     print(f"\n{'ring':<16}{'holes':>6}{'charge kg':>12}")
     for s in summaries:
         print(f"{s['ring']:<16}{s['holes']:>6}{s['total_charge_kg']:>12.2f}")
-    print(f"\nCombined PDF   : {combined_path} ({os.path.getsize(combined_path)} bytes)")
-    print(f"Top view PDF   : {top_path} ({os.path.getsize(top_path)} bytes)")
-    print(f"Package ZIP    : {zip_path} ({os.path.getsize(zip_path)} bytes)")
+    print(f"\nBatch label    : {stope}")
+    print(f"Combined PDF   : {combined_filename} -> {combined_path} ({os.path.getsize(combined_path)} bytes)")
+    print(f"Top view PDF   : {top_filename} -> {top_path} ({os.path.getsize(top_path)} bytes)")
+    print(f"Package ZIP    : {zip_filename} -> {zip_path} ({os.path.getsize(zip_path)} bytes)")
+    print(f"Per-ring PDFs  : reports_pdf/{stope}_R*_blast_report.pdf ({len(entries)} in ZIP)")
+    print(f"Per-ring CSVs  : csv/{stope}_R*_charge.csv ({len(entries)} in ZIP)")
+    print(f"Summary JSON   : generation_summary.json (inside {zip_filename})")
 
 
 if __name__ == "__main__":
