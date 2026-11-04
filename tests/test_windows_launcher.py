@@ -51,6 +51,7 @@ def test_first_run_installs_in_venv_then_launches_local_app(monkeypatch, tmp_pat
     assert str(root / "app.py") in app_command
     assert app_command[app_command.index("--server.address") + 1] == "127.0.0.1"
     assert app_command[app_command.index("--browser.gatherUsageStats") + 1] == "false"
+    assert app_command[app_command.index("--server.showEmailPrompt") + 1] == "false"
     assert options["cwd"] == root
     assert (root / ".venv" / "ringblast-requirements.sha256").is_file()
 
@@ -194,7 +195,8 @@ def test_windows_batch_reports_errors_and_waits_for_key(tmp_path, failure):
         (root / ".venv").mkdir()
     env = os.environ.copy()
     env["PATH"] = str(tmp_path / "no-python-here")
-    cmd = str(Path(env["SystemRoot"]) / "System32" / "cmd.exe")
+    # os.environ is case-insensitive on Windows; its plain dict copy is not.
+    cmd = os.environ["COMSPEC"]
     result = subprocess.run(
         f'"{cmd}" /d /s /c ""{root / "Run_RingBlast.bat"}""',
         cwd=tmp_path, env=env, input="\n", capture_output=True, text=True,

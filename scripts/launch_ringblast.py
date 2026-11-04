@@ -29,6 +29,7 @@ def main():
         result = subprocess.run(
             [sys.executable, "-I", "-m", "streamlit", "run", str(root / "app.py"),
              "--server.address", "127.0.0.1", "--server.port", "8501",
+             "--server.showEmailPrompt", "false",
              "--browser.serverAddress", "127.0.0.1", "--browser.gatherUsageStats", "false"],
             cwd=root,
             check=False,
