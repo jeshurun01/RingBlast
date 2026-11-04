@@ -1,0 +1,2 @@
+# cmd.exe entrypoint should use Windows line endings on checkout.
+Run_RingBlast.bat text eol=crlf
