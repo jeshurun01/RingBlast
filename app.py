@@ -17,10 +17,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+import app_utils
 from app_utils import (
-    combined_report_filename,
     csv_safe_cell,
-    selected_plan_data,
     unique_upload_base,
     upload_fingerprint,
 )
@@ -447,7 +446,8 @@ if st.session_state.get("parsed_data"):
             help="La vue de dessous regarde vers le haut et inverse l'axe X.",
         )
     settings["view_orientation"] = "top" if orientation_label == "Vue de dessus" else "bottom"
-    selected_data = selected_plan_data(parsed_data, selected_names)
+    selected = set(selected_names)
+    selected_data = {name: data for name, data in parsed_data.items() if name in selected}
 
     display_config = (tuple(selected_names), settings["view_orientation"])
     if display_config != st.session_state.get("display_config"):
@@ -666,7 +666,7 @@ if st.session_state.get("results"):
             key="combined_pdf_file_name",
             help="The same sanitized name is used for the PDF download and its copy inside the ZIP.",
         )
-        combined_file_name = combined_report_filename(combined_name_input)
+        combined_file_name = app_utils.combined_report_filename(combined_name_input)
         st.caption(f"Combined PDF will be saved as `{combined_file_name}`.")
 
     zip_bytes = _get_cached_zip_bytes(results, results_formats, combined_file_name)
