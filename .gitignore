@@ -8,9 +8,31 @@ __pycache__/
 dist/
 build/
 
-# Generated outputs
+# Private inputs and generated outputs (never publish site data)
+/inputs/
+/generated*/
 images/
 depth_output/
+
+# Agent workspaces and local verification evidence
+/.worktrees/
+/.task_verify*/
+
+# Internal operational audits/planning (may contain site data)
+/docs/RingBlast_*_audit.md
+/docs/RingBlast_*_t_*.md
+
+# Local secrets and Python tooling
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml
 
 # Legacy folder
 old/

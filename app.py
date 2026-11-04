@@ -17,8 +17,14 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
-from app_utils import csv_safe_cell, unique_upload_base, upload_fingerprint
+import app_utils
+from app_utils import (
+    csv_safe_cell,
+    unique_upload_base,
+    upload_fingerprint,
+)
 from xml_to_image import (
+    DEFAULT_DIAMETER_MM,
     build_charge_table,
     build_figure,
     build_pdf_bytes,
@@ -37,7 +43,7 @@ PREVIEW_MANUAL_MIN_HOLES = 40
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def _parse_uploaded_xml(file_bytes: bytes, filename: str, collar_correction="auto"):
+def _parse_uploaded_xml(file_bytes: bytes, filename: str, collar_correction="off"):
     """Parse XML bytes (cached by content hash)."""
     return parse_xml(
         io.BytesIO(file_bytes),
@@ -89,11 +95,11 @@ def _merged_pdf_bytes(results):
     return merge_pdf_bytes(data["pdf"] for _, data in results.items())
 
 
-def _build_zip_bytes(results, output_formats):
+def _build_zip_bytes(results, output_formats, combined_filename="combined_blast_reports.pdf"):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         if len(results) > 1:
-            zf.writestr("reports_pdf/combined_blast_reports.pdf", _merged_pdf_bytes(results))
+            zf.writestr(f"reports_pdf/{combined_filename}", _merged_pdf_bytes(results))
         for base, data in results.items():
             zf.writestr(f"reports_pdf/{base}_blast_report.pdf", data["pdf"])
             zf.writestr(f"csv/{base}_charge.csv", data["csv"])
@@ -105,7 +111,7 @@ def _build_zip_bytes(results, output_formats):
     return buf.getvalue()
 
 
-def _results_zip_cache_key(results, output_formats):
+def _results_zip_cache_key(results, output_formats, combined_filename="combined_blast_reports.pdf"):
     h = hashlib.md5()
     for base in sorted(results.keys()):
         data = results[base]
@@ -115,14 +121,15 @@ def _results_zip_cache_key(results, output_formats):
             if blob:
                 h.update(blob)
     h.update(repr(sorted(output_formats.items())).encode())
+    h.update(combined_filename.encode())
     return h.hexdigest()
 
 
-def _get_cached_zip_bytes(results, output_formats):
-    key = _results_zip_cache_key(results, output_formats)
+def _get_cached_zip_bytes(results, output_formats, combined_filename="combined_blast_reports.pdf"):
+    key = _results_zip_cache_key(results, output_formats, combined_filename)
     if st.session_state.get("zip_cache_key") == key:
         return st.session_state["zip_cache_bytes"]
-    zip_bytes = _build_zip_bytes(results, output_formats)
+    zip_bytes = _build_zip_bytes(results, output_formats, combined_filename)
     st.session_state["zip_cache_key"] = key
     st.session_state["zip_cache_bytes"] = zip_bytes
     return zip_bytes
@@ -213,7 +220,7 @@ def _build_default_hole_df(holes, charge_params):
     dia_override = charge_params.get("diameter_override_mm", 0)
     for h in holes:
         depth = hole_length(h)
-        diameter = dia_override if dia_override > 0 else int(h["diameter_mm"])
+        diameter = dia_override if dia_override > 0 else h["diameter_mm"]
         stemming = compute_stemming(
             depth, diameter,
             charge_params["stemming_multiplier"],
@@ -299,7 +306,9 @@ with st.sidebar:
         st.divider()
         diameter_override = st.number_input(
             "Hole diameter override (mm)", min_value=0, max_value=500, value=0, step=1,
-            help="Set to 0 to use the diameter from the XML file. Any other value overrides all holes.")
+            help="0 preserves positive XML diameters; zero/missing XML diameters use 89 mm. "
+                 "Any positive override replaces all hole diameters.")
+        st.caption(f"Default fallback: {DEFAULT_DIAMETER_MM:g} mm for zero/missing XML diameters only.")
 
     st.divider()
     with st.expander("📦  Output formats", expanded=True):
@@ -412,6 +421,12 @@ if st.session_state.get("parsed_data"):
     n_files = len(parsed_data)
     n_holes = sum(len(v["holes"]) for v in parsed_data.values())
     st.success(f"{n_files} file{'s' if n_files > 1 else ''} loaded — {n_holes} holes total")
+    fallback_count = sum(h.get("diameter_source", "").startswith("fallback_")
+                         for data in parsed_data.values() for h in data["holes"])
+    if fallback_count:
+        st.warning(f"XML diameter zero/missing: {DEFAULT_DIAMETER_MM:g} mm fallback applied to "
+                   f"{fallback_count} holes. Verify hole purpose before charging; "
+                   "a missing diameter does not establish whether a hole is a reamer.")
 
     st.subheader("Visualisation des plans")
     select_col, view_col = st.columns([3, 2], gap="large")
@@ -632,8 +647,6 @@ if st.session_state.get("results"):
     results = st.session_state["results"]
     results_formats = st.session_state.get("results_formats", output_formats)
     n_zip_files = _zip_entry_count(results, results_formats)
-    zip_bytes = _get_cached_zip_bytes(results, results_formats)
-    zip_size_mb = len(zip_bytes) / (1024 * 1024)
 
     st.divider()
     st.header("Results")
@@ -644,6 +657,20 @@ if st.session_state.get("results"):
     zip_file_name  = (zip_name_input.strip() or "ringblast_output")
     if not zip_file_name.endswith(".zip"):
         zip_file_name += ".zip"
+
+    combined_file_name = "combined_blast_reports.pdf"
+    if len(results) > 1:
+        combined_name_input = st.text_input(
+            "Combined PDF file name",
+            value="combined_blast_reports",
+            key="combined_pdf_file_name",
+            help="The same sanitized name is used for the PDF download and its copy inside the ZIP.",
+        )
+        combined_file_name = app_utils.combined_report_filename(combined_name_input)
+        st.caption(f"Combined PDF will be saved as `{combined_file_name}`.")
+
+    zip_bytes = _get_cached_zip_bytes(results, results_formats, combined_file_name)
+    zip_size_mb = len(zip_bytes) / (1024 * 1024)
 
     dl_zip, dl_merged = st.columns(2)
     with dl_zip:
@@ -660,7 +687,7 @@ if st.session_state.get("results"):
             st.download_button(
                 label=f"⬇  Combined PDF ({len(results)} plans)",
                 data=_get_cached_merged_pdf_bytes(results, results_formats),
-                file_name="combined_blast_reports.pdf",
+                file_name=combined_file_name,
                 mime="application/pdf",
                 width="stretch",
                 type="primary",
@@ -676,7 +703,7 @@ if st.session_state.get("results"):
             )
     _zip_note = "ZIP contains `reports_pdf/` and `csv/`"
     if len(results) > 1:
-        _zip_note += " plus `combined_blast_reports.pdf`"
+        _zip_note += f" plus `reports_pdf/{combined_file_name}`"
     st.caption(_zip_note
                + ("; `plans/`" if results_formats.get("plan_png") else "")
                + ("; `reports_png/`" if results_formats.get("report_png") else "")

@@ -1,5 +1,5 @@
-streamlit
-matplotlib
-pandas
-reportlab
-pypdf
+streamlit>=1.57.0,<2
+matplotlib>=3.10,<4
+pandas>=2.2,<4
+reportlab>=4.4,<5
+pypdf>=6,<7

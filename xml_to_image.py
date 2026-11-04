@@ -14,6 +14,7 @@ import glob
 import os
 import sys
 import math
+from collections import Counter
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend; no display required
 import matplotlib.pyplot as plt
@@ -41,6 +42,7 @@ OUTPUT_DIR    = "images"
 CSV_OUTPUT_DIR = "depth_output"
 
 # ── Charging defaults ────────────────────────────────────────────────────────────
+DEFAULT_DIAMETER_MM       = 89.0  # fallback only for missing/zero XML diameter
 STEMMING_MULTIPLIER       = 20    # x (diameter_mm / 1000) -> stemming in metres
 SHORT_HOLE_THRESHOLD      = 4.0   # m -- holes shorter than this use the special rule
 SHORT_HOLE_FIXED_STEMMING = 1.5   # m -- fixed stemming for short holes (or depth/2 if smaller)
@@ -213,7 +215,7 @@ def _correct_convergent_gallery_center_collars(holes, segments, mode="auto"):
             )
             nh.pop("_collar_move_m", None)
             depth = hole_length(nh)
-            nh["label"] = _format_hole_label(nh["name"], nh["id"], depth)
+            nh["label"] = _format_hole_label(nh.get("display") or nh["name"], nh["id"], depth)
         applied.append(nh)
     return applied
 
@@ -224,6 +226,8 @@ def parse_xml(xml_source, filename=None, collar_correction="off"):
     collar_correction="auto" fixes Deswik-style gallery-centre StartPoints only
     when the holes visibly converge to a tight centre point in gallery void.
     Correction is opt-in. Pass "auto" to enable conservative detection.
+    Zero/missing (including empty) DrillBitDia uses 89 mm; explicit positive
+    diameters are preserved. diameter_source records the fallback per hole.
     """
     tree = ET.parse(xml_source)
     root = tree.getroot()
@@ -244,14 +248,17 @@ def parse_xml(xml_source, filename=None, collar_correction="off"):
         x1, y1, z1 = _point_coordinates(sp, "StartPoint")
         x2, y2, z2 = _point_coordinates(ep, "EndPoint")
 
+        raw_dia = (_text(hole, "drp:DrillBitDia") or "").strip()
         try:
-            drill_dia = float(_text(hole, "drp:DrillBitDia") or 0)
+            drill_dia = float(raw_dia or 0)
         except (TypeError, ValueError) as exc:
             raise ValueError("diamètre de forage invalide") from exc
         if not math.isfinite(drill_dia) or drill_dia < 0:
             raise ValueError("le diamètre de forage doit être fini et positif")
+        diameter_source = "xml"
         if drill_dia == 0:
-            continue
+            drill_dia = DEFAULT_DIAMETER_MM
+            diameter_source = "fallback_zero" if raw_dia else "fallback_missing"
 
         hole_id   = _text(hole, "drp:HoleId")   or ""
         hole_name = _text(hole, "drp:HoleName") or ""
@@ -264,7 +271,25 @@ def parse_xml(xml_source, filename=None, collar_correction="off"):
             "x1": x1, "y1": y1, "z1": z1,
             "x2": x2, "y2": y2, "z2": z2,
             "diameter_mm": drill_dia,
+            "diameter_source": diameter_source,
         })
+
+    # Repeated source names (e.g. Deswik's "UnKnown") cannot be dictionary keys
+    # for per-hole edits or charge overlays. Keep source name/id, disambiguate display.
+    counts = Counter(h["display"] for h in holes)
+    used = {name for name, count in counts.items() if name and count == 1}
+    for index, h in enumerate(holes, start=1):
+        if h["display"] and counts[h["display"]] == 1:
+            continue
+        base = _hole_display_name("", h["id"]) or f"H{index}"
+        display = base
+        suffix = 2
+        while display in used:
+            display = f"{base}_{suffix}"
+            suffix += 1
+        used.add(display)
+        h["display"] = display
+        h["label"] = _format_hole_label(display, h["id"], hole_length(h))
 
     segments = []
     for line in root.findall(".//drp:Line", NS):
@@ -328,7 +353,7 @@ def build_charge_table(holes, stemming_overrides=None, delay_map=None,
     for h in holes:
         hole_key    = h.get("display") or h["name"] or h["id"]
         depth_m     = hole_length(h)
-        diameter_mm = diameter_overrides.get(hole_key, h.get("diameter_mm", 89.0))
+        diameter_mm = diameter_overrides.get(hole_key, h.get("diameter_mm", DEFAULT_DIAMETER_MM))
 
         override = stemming_overrides.get(hole_key)
         try:
@@ -376,7 +401,7 @@ def _charge_row_cells(row):
                  if row["delay_ms"] not in ("", None) else "")
     return [
         row["hole_key"],
-        f"{row['diameter_mm']:.0f}",
+        f"{row['diameter_mm']:g}",
         f"{row['depth_m']:.3f}",
         "",
         f"{row['stemming_m']:.2f}",
@@ -759,7 +784,8 @@ def build_pdf_bytes(plan_name, plan_id, holes, segments, settings, charge_data,
         return TableStyle(cmds)
 
     # ── Info box values ───────────────────────────────────────────────────────
-    _dia_val = f"{charge_data[0]['diameter_mm']:.0f}" if charge_data else "\u2014"
+    _diameters = sorted({row['diameter_mm'] for row in charge_data})
+    _dia_val = ", ".join(f"{diameter:g}" for diameter in _diameters) if _diameters else "\u2014"
     _n_holes = str(len(charge_data))
 
     # ── Draw pages ────────────────────────────────────────────────────────────
