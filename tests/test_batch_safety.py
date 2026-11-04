@@ -59,7 +59,15 @@ def test_cli_invalid_xml_fails_with_filename_without_creating_output(tmp_path, m
     assert not out.exists()
 
 
-def test_parse_batch_rejects_archive_path_separators(tmp_path):
+def test_parse_batch_rejects_backslashes_in_posix_basename(tmp_path, monkeypatch):
+    # A backslash is a legal basename character on POSIX, but an actual path
+    # separator on Windows. Exercise the unsafe-basename rule independently
+    # of the runner OS without rejecting legitimate Windows directory paths.
+    import posixpath
+    from types import SimpleNamespace
+    from scripts import generate_batch_reports as batch
+
+    monkeypatch.setattr(batch, "os", SimpleNamespace(path=posixpath))
     with pytest.raises(ValueError, match='Unsafe'):
         parse_batch([str(tmp_path / r'folder\bad.XML')])
 
