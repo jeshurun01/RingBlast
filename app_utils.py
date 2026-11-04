@@ -12,7 +12,7 @@ _DEFAULT_COMBINED_REPORT = "combined_blast_reports.pdf"
 DEFAULT_BATCH_LABEL = "RingBlast_Batch"
 
 # Trailing ring marker of a batch input file / plan id: "..._R3", "... R10", "...-R2".
-_RING_SUFFIX_RE = re.compile(r"[\s._-]*[Rr]\s*\d+$")
+_RING_SUFFIX_RE = re.compile(r"[\s._-]*(?:SLOT|R)\s*\d+$", re.IGNORECASE)
 
 
 def combined_report_filename(name: str | None) -> str:

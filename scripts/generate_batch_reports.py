@@ -21,12 +21,15 @@ Usage:
 """
 
 import argparse
+import csv
 import glob
 import io
 import json
 import os
+import re
 import sys
 import zipfile
+import xml.etree.ElementTree as ET
 
 # Allow running from anywhere: put the RingBlast project root on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,6 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from xml_to_image import (
+    DEFAULT_DIAMETER_MM,
     build_charge_table,
     build_figure,
     build_pdf_bytes,
@@ -47,6 +51,7 @@ from xml_to_image import (
 from app_utils import (
     batch_stope_label,
     combined_report_filename,
+    csv_safe_cell,
     stope_label_from_name,
 )
 
@@ -80,17 +85,15 @@ DEFAULT_CHARGE_PARAMS = {
 
 
 def ring_key(base):
-    """Sort key: B16_S6_R10 sorts after B16_S6_R9 (numeric on trailing number)."""
-    import re
-    m = re.search(r"R(\d+)(?:_|$)", base, re.IGNORECASE)
-    return (int(m.group(1)) if m else 0, base)
+    """Numeric order for both R<n> and SLOT<n> identifiers."""
+    match = re.search(r"(?:SLOT|R)(\d+)(?:_|$)", base, re.IGNORECASE)
+    return (int(match.group(1)) if match else 0, base)
 
 
 def ring_label(base):
     """Return the compact ring identifier used in the top-view columns."""
-    import re
-    match = re.search(r"R(\d+)(?:_|$)", base, re.IGNORECASE)
-    return f"R{int(match.group(1))}" if match else base
+    match = re.search(r"(SLOT|R)(\d+)(?:_|$)", base, re.IGNORECASE)
+    return f"{match.group(1).upper()}{int(match.group(2))}" if match else base
 
 
 def batch_label(entries):
@@ -143,10 +146,19 @@ def custom_stemming_overrides(entry, start_ring, default_m=2.0,
 
 
 def parse_batch(xml_files, collar_correction="off"):
+    # Validate all output names up front: a dict/ZIP must never silently lose a plan.
+    names = [os.path.splitext(os.path.basename(path))[0] for path in xml_files]
+    if any("\\" in name for name in names):
+        raise ValueError("Unsafe output name: backslashes are not allowed in XML basenames")
+    if len({name.casefold() for name in names}) != len(names):
+        raise ValueError("Duplicate output names in XML batch; rename the files before generation")
     results = []
     for path in sorted(xml_files, key=lambda p: ring_key(os.path.splitext(os.path.basename(p))[0])):
         base = os.path.splitext(os.path.basename(path))[0]
-        plan_name, plan_id, holes, segments = parse_xml(path, collar_correction=collar_correction)
+        try:
+            plan_name, plan_id, holes, segments = parse_xml(str(path), collar_correction=collar_correction)
+        except (ValueError, OSError, ET.ParseError) as exc:
+            raise ValueError(f"{path}: {exc}") from exc
         results.append({"base": base, "path": path, "plan_name": plan_name,
                         "plan_id": plan_id, "holes": holes, "segments": segments})
     return results
@@ -154,8 +166,13 @@ def parse_batch(xml_files, collar_correction="off"):
 
 def build_report_pdf(entry, settings, charge_params, stemming_overrides=None):
     """One ring -> PDF bytes, charge CSV rows, totals (app's build_pdf_bytes)."""
+    override = charge_params.get("diameter_override_mm", 0)
+    diameter_overrides = {
+        h.get("display") or h["name"] or h["id"]: override for h in entry["holes"]
+    } if override > 0 else None
     charge_data = build_charge_table(
         entry["holes"],
+        diameter_overrides=diameter_overrides,
         stemming_overrides=stemming_overrides,
         stemming_multiplier=charge_params["stemming_multiplier"],
         short_threshold=charge_params["short_threshold"],
@@ -172,21 +189,18 @@ def build_report_pdf(entry, settings, charge_params, stemming_overrides=None):
 
 def build_top_view_grid(entries, settings, out_path):
     """Render one page of collar points in normalized, ring-labelled columns."""
-    import re
-
     if not entries:
         raise ValueError("at least one ring is required for the top view")
 
     def ring_number(entry):
-        match = re.search(r"R(\d+)(?:_|$)", entry["base"], re.IGNORECASE)
-        return int(match.group(1)) if match else 0
+        return ring_key(entry["base"])[0]
 
-    entries = sorted(entries, key=ring_number)
+    entries = sorted(entries, key=lambda entry: ring_key(entry["base"]))
     numbers = [ring_number(entry) for entry in entries]
     cmap = matplotlib.colormaps["turbo"]
     norm = matplotlib.colors.Normalize(vmin=min(numbers), vmax=max(numbers) if len(set(numbers)) > 1 else min(numbers) + 1)
 
-    fig, ax = plt.subplots(figsize=(16.5, 11.7))  # A3 landscape source image
+    fig, ax = plt.subplots(figsize=(420 / 25.4, 297 / 25.4))  # exact A3 landscape
     for column, entry in enumerate(entries, start=1):
         collars_x = [hole["x1"] for hole in entry["holes"]]
         collars_y = [hole["y1"] for hole in entry["holes"]]
@@ -211,8 +225,8 @@ def build_top_view_grid(entries, settings, out_path):
         ax.text(column, -0.10, ring_label(entry["base"]), ha="center", va="top", fontsize=13, fontweight="bold")
 
     prefix = entries[0]["base"].rsplit("_", 1)[0] if "_" in entries[0]["base"] else ""
-    ring_range = f"R{numbers[0]} to R{numbers[-1]}"
-    title = f"{prefix + ' — ' if prefix else ''}TOP VIEW — Rings {ring_range}"
+    ring_range = f"{ring_label(entries[0]['base'])} to {ring_label(entries[-1]['base'])}"
+    title = f"{prefix + ' — ' if prefix else ''}TOP VIEW — {ring_range}"
     ax.set_title(title, fontsize=18, fontweight="bold", pad=18)
     ax.set_xlim(0.4, len(entries) + 0.6)
     ax.set_ylim(-0.18, 1.10)
@@ -235,9 +249,12 @@ def build_top_view_grid(entries, settings, out_path):
     scalar = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
     scalar.set_array([])
     colorbar = fig.colorbar(scalar, ax=ax, fraction=0.025, pad=0.02, ticks=numbers)
-    colorbar.set_label("Ring number")
+    colorbar.set_label("Plan identifier")
+    colorbar.set_ticklabels([ring_label(entry["base"]) for entry in entries])
     fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
+    # Direct PDF keeps labels searchable and avoids a large PNG + re-embedding.
+    is_pdf = os.fspath(out_path).lower().endswith(".pdf")
+    fig.savefig(out_path, dpi=200, bbox_inches=None if is_pdf else "tight", facecolor="white")
     plt.close(fig)
     return out_path
 
@@ -269,9 +286,16 @@ def main():
         print("No XML files found.", file=sys.stderr)
         sys.exit(1)
 
+    try:
+        entries = parse_batch(xml_files, collar_correction=args.collar_correction)
+    except ValueError as exc:
+        ap.error(str(exc))
     os.makedirs(args.output, exist_ok=True)
-    entries = parse_batch(xml_files, collar_correction=args.collar_correction)
     print(f"Parsed {len(entries)} XML(s)")
+    fallback_count = sum(h.get("diameter_source", "").startswith("fallback_")
+                         for entry in entries for h in entry["holes"])
+    print(f"Diameter fallback: {DEFAULT_DIAMETER_MM:g} mm for {fallback_count} zero/missing XML diameters; "
+          "explicit positive diameters preserved")
 
     stope = batch_label(entries)
     names = batch_artifact_names(stope, combined_name=args.combined_name)
@@ -302,16 +326,18 @@ def main():
             "ring": e["base"], "holes": len(charge_data),
             "total_charge_kg": round(total_kg, 2),
             "diameter_mm": charge_data[0]["diameter_mm"] if charge_data else None,
+            "diameters_mm": sorted({row["diameter_mm"] for row in charge_data}),
+            "diameter_fallback_holes": sum(h.get("diameter_source", "").startswith("fallback_")
+                                           for h in e["holes"]),
         })
         # CSV rows (same header as app)
         buf = io.StringIO()
-        import csv
         writer = csv.writer(buf)
         writer.writerow(["Number", "Diameter (mm)", "Length (m)", "Actual meters",
                          "Stemming (m)", "Charge length (m)", "Charge (kg)",
                          "Actual charge", "Delay (ms)"])
         for r in charge_data:
-            writer.writerow([r["hole_key"], f"{r['diameter_mm']:.0f}", f"{r['depth_m']:.3f}",
+            writer.writerow([csv_safe_cell(r["hole_key"]), f"{r['diameter_mm']:g}", f"{r['depth_m']:.3f}",
                              "", f"{r['stemming_m']:.2f}", f"{r['charge_length_m']:.2f}",
                              f"{r['charge_kg']:.2f}", "", r["delay_ms"] if r["delay_ms"] != "" else ""])
         csv_bytes[e["base"]] = buf.getvalue().encode()
@@ -324,23 +350,7 @@ def main():
 
     # 2) Single-page top view of all rings
     top_path = os.path.join(args.output, top_filename)
-    png_tmp = os.path.join(args.output, "_top_view_all_rings.png")
-    build_top_view_grid(entries, settings, png_tmp)
-    # embed PNG into a one-page A3 landscape PDF
-    from reportlab.lib.pagesizes import A3, landscape
-    from reportlab.lib.utils import ImageReader
-    from reportlab.pdfgen import canvas
-    c = canvas.Canvas(top_path, pagesize=landscape(A3))
-    W, H = landscape(A3)
-    img = ImageReader(png_tmp)
-    iw, ih = img.getSize()
-    margin = 14
-    scale = min((W - 2 * margin) / iw, (H - 2 * margin) / ih)
-    dw, dh = iw * scale, ih * scale
-    c.drawImage(img, (W - dw) / 2, (H - dh) / 2, width=dw, height=dh,
-                preserveAspectRatio=True, anchor="c")
-    c.showPage()
-    c.save()
+    build_top_view_grid(entries, settings, top_path)
 
     # 3) Individual PDFs + CSVs + combined + top view + summary -> ZIP package
     zip_path = os.path.join(args.output, zip_filename)
@@ -349,9 +359,9 @@ def main():
         for e in entries:
             zf.writestr(f"reports_pdf/{e['base']}_blast_report.pdf", pdf_bytes[e["base"]])
             zf.writestr(f"csv/{e['base']}_charge.csv", csv_bytes[e["base"]])
-        zf.writestr(f"top_view/{top_filename}", open(top_path, "rb").read())
+        zf.write(top_path, f"top_view/{top_filename}")
         zf.writestr("generation_summary.json", json.dumps({
-            "source_zip": os.path.basename(args.xml[0]).split(".")[0],
+            "source_zip": None,  # CLI receives XML paths, not an archive
             "source_files": [os.path.basename(e["path"]) for e in entries],
             "source_count": len(entries),
             "batch_label": stope,
@@ -370,6 +380,8 @@ def main():
             "rings": summaries,
             "settings": settings,
             "charge_params": charge_params,
+            "diameter_fallback": {"diameter_mm": DEFAULT_DIAMETER_MM,
+                                  "holes": fallback_count, "when": "zero or missing XML diameter"},
             "collar_correction": args.collar_correction,
             "custom_stemming": (
                 {
@@ -391,8 +403,8 @@ def main():
     print(f"Combined PDF   : {combined_filename} -> {combined_path} ({os.path.getsize(combined_path)} bytes)")
     print(f"Top view PDF   : {top_filename} -> {top_path} ({os.path.getsize(top_path)} bytes)")
     print(f"Package ZIP    : {zip_filename} -> {zip_path} ({os.path.getsize(zip_path)} bytes)")
-    print(f"Per-ring PDFs  : reports_pdf/{stope}_R*_blast_report.pdf ({len(entries)} in ZIP)")
-    print(f"Per-ring CSVs  : csv/{stope}_R*_charge.csv ({len(entries)} in ZIP)")
+    print(f"Per-plan PDFs  : reports_pdf/<source_name>_blast_report.pdf ({len(entries)} in ZIP)")
+    print(f"Per-plan CSVs  : csv/<source_name>_charge.csv ({len(entries)} in ZIP)")
     print(f"Summary JSON   : generation_summary.json (inside {zip_filename})")
 
 

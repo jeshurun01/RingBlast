@@ -25,6 +25,7 @@ from app_utils import (
     upload_fingerprint,
 )
 from xml_to_image import (
+    DEFAULT_DIAMETER_MM,
     build_charge_table,
     build_figure,
     build_pdf_bytes,
@@ -43,7 +44,7 @@ PREVIEW_MANUAL_MIN_HOLES = 40
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def _parse_uploaded_xml(file_bytes: bytes, filename: str, collar_correction="auto"):
+def _parse_uploaded_xml(file_bytes: bytes, filename: str, collar_correction="off"):
     """Parse XML bytes (cached by content hash)."""
     return parse_xml(
         io.BytesIO(file_bytes),
@@ -220,7 +221,7 @@ def _build_default_hole_df(holes, charge_params):
     dia_override = charge_params.get("diameter_override_mm", 0)
     for h in holes:
         depth = hole_length(h)
-        diameter = dia_override if dia_override > 0 else int(h["diameter_mm"])
+        diameter = dia_override if dia_override > 0 else h["diameter_mm"]
         stemming = compute_stemming(
             depth, diameter,
             charge_params["stemming_multiplier"],
@@ -306,7 +307,9 @@ with st.sidebar:
         st.divider()
         diameter_override = st.number_input(
             "Hole diameter override (mm)", min_value=0, max_value=500, value=0, step=1,
-            help="Set to 0 to use the diameter from the XML file. Any other value overrides all holes.")
+            help="0 preserves positive XML diameters; zero/missing XML diameters use 89 mm. "
+                 "Any positive override replaces all hole diameters.")
+        st.caption(f"Default fallback: {DEFAULT_DIAMETER_MM:g} mm for zero/missing XML diameters only.")
 
     st.divider()
     with st.expander("📦  Output formats", expanded=True):
@@ -419,6 +422,12 @@ if st.session_state.get("parsed_data"):
     n_files = len(parsed_data)
     n_holes = sum(len(v["holes"]) for v in parsed_data.values())
     st.success(f"{n_files} file{'s' if n_files > 1 else ''} loaded — {n_holes} holes total")
+    fallback_count = sum(h.get("diameter_source", "").startswith("fallback_")
+                         for data in parsed_data.values() for h in data["holes"])
+    if fallback_count:
+        st.warning(f"XML diameter zero/missing: {DEFAULT_DIAMETER_MM:g} mm fallback applied to "
+                   f"{fallback_count} holes. Verify hole purpose before charging; "
+                   "a missing diameter does not establish whether a hole is a reamer.")
 
     st.subheader("Visualisation des plans")
     select_col, view_col = st.columns([3, 2], gap="large")
